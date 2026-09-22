@@ -1,0 +1,195 @@
+from __future__ import annotations
+
+import collections
+import json
+import os
+import re
+from dataclasses import dataclass
+from typing import Callable
+
+import safetensors
+import torch
+from freetoken.utils import download_hf_weight
+from tqdm import tqdm
+
+LayerToBank = Callable[[int, object], int | None]
+DropPageCache = Callable[[str], None]
+
+
+@dataclass(frozen=True)
+class Nvfp4ExpertSourceSpec:
+    key_pattern: re.Pattern[str]
+    proj_to_role: dict[str, str]
+    layer_to_bank: LayerToBank
+    desc: str
+    # Maps checkpoint tensor-kind names onto the canonical (modelopt) kinds, e.g.
+    # compressed-tensors' weight_packed -> weight, weight_global_scale -> weight_scale_2.
+    kind_map: dict[str, str] | None = None
+    # The checkpoint stores the QUANT-side global scale (local fp8 scales were
+    # multiplied by it before the cast); the banks keep its reciprocal.
+    global_reciprocal: bool = False
+
+
+def _canon_kind(spec: "Nvfp4ExpertSourceSpec", kind: str) -> str:
+    return spec.kind_map.get(kind, kind) if spec.kind_map else kind
+
+
+def _ingest_global(spec: "Nvfp4ExpertSourceSpec", tensor: torch.Tensor) -> torch.Tensor:
+    if spec.global_reciprocal:
+        tensor = 1.0 / tensor.float()
+    return tensor.to(torch.float16)
+
+
+def _num_moe_layers(config) -> int:
+    value = getattr(config, "num_moe_layers", None)
+    if value is not None:
+        return int(value)
+    return int(config.num_layers) - int(getattr(config, "first_k_dense_replace", 0))
+
+
+def _bank_layer(spec: Nvfp4ExpertSourceSpec, layer: int, config) -> int | None:
+    bank_layer = spec.layer_to_bank(layer, config)
+    if bank_layer is None:
+        return None
+    num_layers = _num_moe_layers(config)
+    if bank_layer < 0 or bank_layer >= num_layers:
+        raise ValueError(
+            f"{spec.desc}: bank layer {bank_layer} for checkpoint layer {layer} "
+            f"is outside [0, {num_layers})"
+        )
+    return bank_layer
+
+
+def _kind_suffix(kind: str) -> str:
+    return {"weight": "", "weight_scale": "_scale", "weight_scale_2": "_global"}[kind]
+
+
+def _tp_expert_geometry(config):
+    """TP-local expert geometry ``(I, I_loc, lo, hi)`` for the expert pieces.
+
+    The expert intermediate axis shards across TP ranks: gate/up are column-
+    parallel (their output rows split), down is row-parallel (its packed input
+    axis splits with the packing factor). The rank's slice keeps NVFP4 block
+    alignment (I_loc % 16 == 0), so packed bytes and per-16 scale groups split
+    cleanly. At TP=1 the geometry is the identity (I_loc == I, [lo, hi) == [0, I)).
+    Must match MoEConfig.local_intermediate (the kernels size their banks from it).
+    """
+    from freetoken.distributed import get_tp_info
+    from freetoken.utils import div_even
+
+    tp = get_tp_info()
+    I = config.moe_intermediate_size
+    if tp.size == 1:
+        return I, I, 0, I
+    I_loc = div_even(I, tp.size)
+    assert I_loc % 16 == 0, (
+        f"TP expert slice {I_loc} must stay 16-block aligned "
+        f"(moe_intermediate_size {I}, tp {tp.size})"
+    )
+    assert I // tp.size == I_loc, "MoEConfig.local_intermediate disagrees with the slice geometry"
+    r = tp.rank
+    return I, I_loc, r * I_loc, (r + 1) * I_loc
+
+
+def _tp_slice_piece(role: str, tensor: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
+    """One expert piece -> this rank's shard of the intermediate axis.
+
+    gate/up store ``[I, ...]`` (the sliced axis is the OUTPUT rows, one scale row
+    each); down stores ``[H, I/2]`` codes / ``[H, I/16]`` scales (the sliced axis
+    is the packed INPUT). Per-expert globals are unsliced.
+    """
+    if tensor.ndim <= 1 or role.endswith("_global"):
+        return tensor
+    if role.startswith("down"):
+        factor = 2 if tensor.dtype == torch.uint8 else 16
+        return tensor[..., lo // factor : hi // factor]
+    return tensor[lo:hi]
+
+
+def iter_nvfp4_expert_pieces(
+    model_path: str,
+    config,
+    spec: Nvfp4ExpertSourceSpec,
+    *,
+    parallel: bool = False,
+    workers: int = 8,
+    chunk: int = 8 << 20,
+    drop_page_cache: DropPageCache | None = None,
+    primary: bool = True,
+):
+    """One piece per routed expert: ``gate`` / ``up`` / ``down`` codes plus their ``_scale``
+    (fp8 block scales) and ``_global`` (the per-tensor scale, reciprocal for quant-side dialects,
+    fp16) companions, straight from the safetensors shards.
+
+    Serial reads walk the shards in order; ``parallel`` uses the chunked O_DIRECT reader. Either
+    way tensors of one expert may span shards, so they are grouped by (layer, expert) as they land.
+
+    TP: every piece is pre-sliced to the rank's intermediate shard (_tp_expert_geometry),
+    so the banks built from method.layout()'s local_intermediate hold exactly the
+    rank's slice -- the offload path shards across ranks instead of computing the
+    full experts per rank (and double-counting through the layer all_reduce).
+    """
+    from freetoken.models.loader import drop_page_cache as _drop
+    from freetoken.moe.expert_pieces import per_expert_pieces
+
+    drop = drop_page_cache or _drop
+    folder = download_hf_weight(model_path)
+    with open(os.path.join(folder, "model.safetensors.index.json"), encoding="utf-8") as f:
+        weight_map = json.load(f)["weight_map"]
+
+    wanted: dict[str, tuple[int, int, str]] = {}
+    for name in weight_map:
+        match = spec.key_pattern.match(name)
+        if match is None:
+            continue
+        bank_layer = _bank_layer(spec, int(match.group("layer")), config)
+        if bank_layer is None:
+            continue
+        proj = match.group("proj")
+        if proj not in spec.proj_to_role:
+            raise ValueError(f"{spec.desc}: unknown NVFP4 expert projection {proj!r}")
+        kind = _canon_kind(spec, match.group("kind"))
+        if kind not in ("weight", "weight_scale", "weight_scale_2"):
+            raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
+        wanted[name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + _kind_suffix(kind))
+    expected = _num_moe_layers(config) * config.num_experts * 9
+    if len(wanted) != expected:
+        raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {expected}")
+
+    _, _, lo, hi = _tp_expert_geometry(config)
+
+    def _serial():
+        by_shard: dict[str, list[str]] = collections.defaultdict(list)
+        for name, shard in weight_map.items():
+            if name in wanted:
+                by_shard[shard].append(name)
+        for shard in tqdm(sorted(by_shard), desc=f"Loading {spec.desc}", disable=not primary):
+            path = os.path.join(folder, shard)
+            drop(path)
+            with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+                for name in by_shard[shard]:
+                    tensor = f.get_tensor(name)
+                    if wanted[name][2].endswith("_global"):
+                        tensor = _ingest_global(spec, tensor)
+                    else:
+                        tensor = _tp_slice_piece(wanted[name][2], tensor, lo, hi)
+                    yield name, tensor
+            drop(path)
+
+    def _parallel():
+        from freetoken.models.weight import iter_expert_tensors_parallel
+
+        for name, tensor in iter_expert_tensors_parallel(folder, lambda n: n in wanted, workers=workers, chunk=chunk):
+            if wanted[name][2].endswith("_global"):
+                tensor = _ingest_global(spec, tensor)
+            else:
+                tensor = _tp_slice_piece(wanted[name][2], tensor, lo, hi)
+            yield name, tensor
+
+    return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
+
+
+__all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]
+
+
+__all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]

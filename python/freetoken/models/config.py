@@ -1,0 +1,496 @@
+from __future__ import annotations
+import os
+from dataclasses import dataclass
+from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
+
+from freetoken.attention.base import AttnType
+
+# State-dict key prefixes for the (optional) vision stack. Used both to drop the vision
+# config (so the tower is never built) and to skip the matching tensors in the FTW reader.
+VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.")
+_VISION_TRUE = {"1", "true", "yes", "on"}
+
+
+def vision_load_enabled() -> bool:
+    """Vision is opt-in (default OFF). The vision tower + multimodal embedder are ~1 GiB of
+    resident, never-quantized (bf16) GPU weights that text-only serving never touches, so we
+    skip building and loading them unless ``FREETOKEN_LOAD_VISION=1`` is set."""
+    return os.getenv("FREETOKEN_LOAD_VISION", "0").strip().lower() in _VISION_TRUE
+
+
+def detect_expert_quant(hf_config: Any) -> str:
+    """Routed-expert quantization from the checkpoint's dialect layer (``QuantConfig``),
+    the same resolution the engine uses -- one source of truth instead of a second
+    detector. Returns a ``QuantKind`` string (``"nvfp4"`` / ``"fp8_block"`` / ...), or
+    the lowercased algo string as a last resort (unsupported/unknown dialects)."""
+    quant = getattr(hf_config, "quantization_config", None)
+    if quant is None:
+        return "none"
+    get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    if not (get("quant_algo") or get("quant_method") or get("config_groups") or get("format")):
+        return "none"
+    from freetoken.layers.quantization import QuantConfig
+
+    try:
+        kind = QuantConfig.from_hf(hf_config).expert_kind()
+    except NotImplementedError:
+        kind = None
+    if kind is not None:
+        return kind
+    # The dialect could not parse the config (e.g. a compressed-tensors group without
+    # a strategy/block structure): fall back to the coarse format/algo heuristic.
+    groups = get("config_groups") or {}
+    entries = groups.values() if isinstance(groups, dict) else groups or ()
+    expert_formats = [
+        str((g or {}).get("format") or "").lower()
+        for g in entries
+        if any("experts" in str(t) for t in ((g or {}).get("targets") or ()))
+    ]
+    if any("nvfp4" in fmt for fmt in expert_formats):
+        return "nvfp4"
+    algo = get("quant_algo") or get("quant_method")
+    if "nvfp4" in str(get("format") or "").lower():
+        return "nvfp4"
+    return str(algo).lower() if algo else "none"
+
+
+def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
+    """Whether a compressed-tensors checkpoint has an NVFP4 (W4A16) group (dense
+    Qwen3.6-27B, Muse-Glimmer-30B-NVFP4, ...).
+
+    Delegates to the shared ``QuantConfig`` dialect layer, so the scheme geometry lives
+    in one place. An unsupported 4-bit float group (MXFP4: group_size 32) still raises a
+    clear ValueError instead of routing into the NVFP4 loader and dying in a shape assert."""
+    quant = getattr(hf_config, "quantization_config", None)
+    if quant is None:
+        return False
+    get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    if str(get("quant_method") or "").lower() != "compressed-tensors":
+        return False
+    from freetoken.layers.quantization import CompressedTensorsConfig, QuantConfig
+
+    try:
+        qc = QuantConfig.from_hf(hf_config)
+    except NotImplementedError as exc:
+        raise ValueError(f"unsupported compressed-tensors scheme: {exc}") from None
+    return isinstance(qc, CompressedTensorsConfig) and qc.has_kind("nvfp4")
+
+
+@dataclass(frozen=True)
+class RotaryConfig:
+    head_dim: int
+    rotary_dim: int
+    max_position: int
+    base: float
+    scaling: Dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class KVCacheGroupSpec:
+    name: str
+    layer_ids: Tuple[int, ...]
+    num_kv_heads: int
+    head_dim: int
+    sliding_window: int | None
+    # Latent-KV MLA group: the pool stores ONE latent slab per token (no separate V)
+    # and the cost model budgets 1x instead of 2x per token. When the model also runs
+    # DSA, ``index_head_dim``/``num_index_layers`` size the index-key slab, so the
+    # pool factory and the cost model derive the same bytes from the same spec.
+    mla: bool = False
+    index_head_dim: int = 0
+    num_index_layers: int = 0
+    # Grouped index-key compression: one index-key row per ``index_ratio`` tokens
+    # (QSA groups, glm5_next kpool pools; 1 keeps the per-token BSA/DSA slab). The
+    # pool factory and the KV cost model divide by the same value.
+    index_ratio: int = 1
+    # Attention-type taxonomy value for this group; drives the backend capability
+    # matrix and (with the pool factory) selects the KV pool family.
+    attn_type: AttnType = AttnType.FULL
+
+    @property
+    def num_layers(self) -> int:
+        return len(self.layer_ids)
+
+    @property
+    def is_swa(self) -> bool:
+        return self.name == "swa"
+
+
+@dataclass(frozen=True)
+class BaseAttentionGroupConfig:
+    name: str
+    layer_ids: Tuple[int, ...]
+
+    def owns_layer(self, layer_id: int) -> bool:
+        return layer_id in self.layer_ids
+
+
+@dataclass(frozen=True)
+class FullAttentionGroupConfig(BaseAttentionGroupConfig):
+    kind: ClassVar[Literal["full"]] = "full"
+    cache_kind: ClassVar[Literal["paged_kv"]] = "paged_kv"
+
+    num_kv_heads: int
+    head_dim: int
+    rotary_config: RotaryConfig
+    k_eq_v: bool = False
+    # Latent-KV MLA (single latent slab, V aliases K). With DSA, ``index_head_dim`` /
+    # ``num_index_layers`` size the index-key slab -- the pool factory and the KV cost
+    # model both read these, so they can never disagree.
+    mla: bool = False
+    index_head_dim: int = 0
+    num_index_layers: int = 0
+    # Grouped index-key compression ratio (see KVCacheGroupSpec.index_ratio).
+    # GQA + ratio > 1 -> AttnType.QSA (Qwen3.8); MLA + ratio > 1 -> the glm5_next
+    # kpool DSA layout (attn type stays DSA; the pool factory branches on mla).
+    index_ratio: int = 1
+
+
+@dataclass(frozen=True)
+class SWAAttentionGroupConfig(BaseAttentionGroupConfig):
+    kind: ClassVar[Literal["swa"]] = "swa"
+    cache_kind: ClassVar[Literal["swa_kv"]] = "swa_kv"
+
+    num_kv_heads: int
+    head_dim: int
+    rotary_config: RotaryConfig
+    sliding_window: int
+
+
+@dataclass(frozen=True)
+class LinearGatedDeltaGroupConfig(BaseAttentionGroupConfig):
+    kind: ClassVar[Literal["linear_gated_delta"]] = "linear_gated_delta"
+    cache_kind: ClassVar[Literal["linear_state"]] = "linear_state"
+
+    num_key_heads: int
+    num_value_heads: int
+    key_head_dim: int
+    value_head_dim: int
+    conv_kernel_dim: int
+    # Output-gate activation name ("silu", "sigmoid"), forwarded to rms_norm_gated.
+    output_gate: str
+    # "gdn" and "kda" share the same state geometry (one LinearStatePool serves
+    # both); the variant selects the kernels.
+    variant: Literal["gdn", "kda"] = "gdn"
+
+
+@dataclass(frozen=True)
+class DSV4AttentionGroupConfig(BaseAttentionGroupConfig):
+    """DSV4 sparse attention (window + compressed tiers + Lightning Indexer). Standalone
+    class on purpose: subclassing SWAAttentionGroupConfig would flip has_swa_attention
+    and reroute DSV4 through the SWA gates. Geometry beyond the latent width lives in
+    dsv4_args; the pool prices itself from there, not from this spec."""
+
+    kind: ClassVar[Literal["dsv4"]] = "dsv4"
+    cache_kind: ClassVar[Literal["dsv4_paged"]] = "dsv4_paged"
+
+    num_kv_heads: int
+    head_dim: int
+    sliding_window: int  # the P-token window page
+
+
+AttentionGroupConfig: TypeAlias = (
+    FullAttentionGroupConfig
+    | SWAAttentionGroupConfig
+    | LinearGatedDeltaGroupConfig
+    | DSV4AttentionGroupConfig
+)
+
+
+def _full_group_attn_type(group: FullAttentionGroupConfig) -> AttnType:
+    # Mirrors the pool-factory split: mla + index slab -> DSAKVCache, mla -> MLAKVCache,
+    # GQA (non-mla) + index slab -> QSAKVCache when the index keys are compressed
+    # (index_ratio > 1, Qwen3.8-Flash-Next) else BSAKVCache (MiniMax-M3 block-sparse).
+    if not group.mla:
+        if group.index_head_dim > 0 and group.num_index_layers > 0:
+            return AttnType.QSA if group.index_ratio > 1 else AttnType.BSA
+        return AttnType.FULL
+    if group.index_head_dim > 0 and group.num_index_layers > 0:
+        return AttnType.DSA
+    return AttnType.MLA
+
+
+@dataclass(frozen=True)
+class SlotStateSpec:
+    """One extra per-request tensor riding the LinearStatePool slots.
+
+    Allocated as ``[max(1, len(layer_ids)), num_slots, *shape]`` and advanced, snapshot,
+    COW'd and rebuilt with the GDN state; the owner reads it back through
+    ``pool.slot_state(name, layer_id)``. ``shape`` is per slot and TP-replicated.
+    """
+
+    name: str
+    shape: Tuple[int, ...]
+    layer_ids: Tuple[int, ...] = ()
+    dtype: Any | None = None  # a torch dtype; None -> the pool's compute dtype
+    fill_value: float = 0.0
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    num_layers: int
+    num_qo_heads: int
+    num_kv_heads: int
+    head_dim: int
+    hidden_size: int
+    vocab_size: int
+    intermediate_size: int
+    rms_norm_eps: float
+    rotary_config: RotaryConfig
+    hidden_act: str
+    tie_word_embeddings: bool
+    num_experts: int
+    num_experts_per_tok: int
+    moe_intermediate_size: int
+    norm_topk_prob: bool
+    model_type: str
+    architectures: list[str]
+    moe_strategy: str = "fused"
+    # where routed experts decode (gpu / cpu / hybrid); set by the engine from the flags, it gates which expert kernels can serve
+    decode_target: str = "gpu"
+    # The QuantConfig the engine builds from the checkpoint; layers ask it for their method.
+    quant: Any | None = None
+    # ----- optional, model-specific extensions (default keeps other models intact) -----
+    moe_enabled: bool = False
+    # Weight quantization of the MoE experts only. "none" keeps the default BF16
+    # offload/fused path; "nvfp4" stores experts as packed FP4 + block scales;
+    # "fp8_block" is DeepSeek-V3-style 128x128 block-fp8 (weight fp8-e4m3 +
+    # weight_scale_inv per block), also applied to the dense projections.
+    expert_quant: str = "none"
+    # Block size (out, in) for block-wise weight quantization (fp8_block: (128, 128)).
+    weight_block_size: tuple[int, int] | None = None
+    # the checkpoint's quant kind for the dense attention / GatedDeltaNet projections, detected by the family's parse_config for its reader
+    attn_quant: str = "none"
+    # the checkpoint's quant kind for the dense MLP projections (shared expert, dense layers), detected the same way
+    dense_quant: str = "none"
+    # the checkpoint's quant kind for the lm_head, detected the same way (only some NVFP4 exports quantize it)
+    lm_head_quant: str = "none"
+    shared_expert_intermediate_size: int = 0
+    use_qk_norm: bool = False
+    # ----- DeepSeek/GLM-style MoE extensions (default keeps other models intact) -----
+    # The first ``first_k_dense_replace`` decoder layers use a dense MLP instead of the
+    # sparse MoE block (GLM-4: 3). Experts (and the offload cache) therefore only exist
+    # for layers ``[first_k_dense_replace, num_layers)``.
+    first_k_dense_replace: int = 0
+    # Always-on shared expert(s) added to every MoE layer's output (GLM-4: 1).
+    n_shared_experts: int = 0
+    # Selected-expert weights are multiplied by this after renormalization (GLM-4: 2.5).
+    routed_scaling_factor: float = 1.0
+    # Group-limited routing (DeepSeek-V3 noaux_tc); GLM-4 uses n_group=topk_group=1 so the
+    # grouping is a no-op, but we keep the knobs for completeness.
+    n_group: int = 1
+    topk_group: int = 1
+    attn_sm_scale: float | None = None  # None -> 1/sqrt(head_dim)
+    final_logit_softcapping: float | None = None
+    embedding_scale: float | None = None
+    # Second RMSNorm eps for models whose post-sublayer norms use a different eps than the
+    # pre-sublayer ones (muse_glimmer: post_attention/post_feedforward at 1e-8 vs 1e-5).
+    post_norm_eps: float | None = None
+    # Scalar the raw lm_head logits are multiplied by BEFORE final_logit_softcapping
+    # (muse_glimmer: 1/sqrt(hidden/256)); None leaves the logits unscaled.
+    output_multiplier: float | None = None
+    vision_config: Any | None = None
+    image_token_id: int | None = None
+    attention_groups: Tuple[AttentionGroupConfig, ...] = ()
+    has_attn_bias: bool = False
+    has_router_bias: bool = False
+    moe_weight_format: str | None = None
+    swiglu_limit: float | None = None
+    hidden_act_alpha: float = 1.702
+    # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,
+    # CSA/HCA compressors, Lightning Indexer, manifold-constrained Hyper-Connections,
+    # hash routing). Opaque to model-agnostic engine code; None for non-DSV4 models.
+    dsv4_args: Any | None = None
+    # GLM-5.2 (glm_moe_dsa) MLA/DSA payload (GlmMoeDsaArgs): the MLA low-rank dims and the
+    # DSA indexer geometry the model module needs. Opaque to model-agnostic engine code;
+    # None for every other model.
+    glm_dsa_args: Any | None = None
+    # GLM-5.3-Flash (glm5_next) payload (Glm5NextArgs): NoPE-MLA dims, the kpool indexer
+    # geometry, the KDA head config, and the mHC knobs. Opaque to model-agnostic engine
+    # code; None for every other model.
+    glm5_args: Any | None = None
+    # MiniMax-M3 (minimax_m3) payload (MiniMaxM3Args): the block-sparse indexer geometry
+    # (index heads/dim, top-k blocks, init/local blocks, sparse layer set) plus the
+    # swigluoai/dense-MLP scalars the model module needs. Opaque to model-agnostic engine
+    # code; None for every other model.
+    m3_args: Any | None = None
+    # Qwen3.8-Flash-Next (qwen4_exp) payload (Qwen4ExpArgs): hyper-connection widths, PLE
+    # n-gram embedding geometry and the QSA indexer scoring geometry the model module
+    # needs. Opaque to model-agnostic engine code; None for every other model.
+    qwen4_args: Any | None = None
+    # DeepSeek-V4.1 (deepseek_v41) payload (DeepseekV41Args): CSA2 compress/kv-source
+    # geometry, Engram n-gram memory geometry and the DSpark draft scalars the model
+    # module needs. Opaque to model-agnostic engine code; None for every other model.
+    dsv41_args: Any | None = None
+    # Generic execution-path capability flags (set by a model's parse_config) so the engine and
+    # factories stay model-agnostic instead of branching on dsv4_args:
+    single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
+    # A draft head (MTP/DSpark) is built for this serve (FREETOKEN_ENABLE_MTP + the
+    # checkpoint shipping one). The FTW replay must NOT skip the draft's dense keys then.
+    mtp_enabled: bool = False
+    # Number of ``mtp.layers.N`` blocks the checkpoint ships (0 = no draft head). Their
+    # attention layer ids continue after the main stack (num_layers + i).
+    mtp_num_layers: int = 0
+    # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
+    # () for models without any. Requires a linear-attention group to ride on.
+    slot_states: Tuple[SlotStateSpec, ...] = ()
+
+    @property
+    def is_moe(self) -> bool:
+        return "moe" in self.model_type or self.moe_enabled
+
+    @property
+    def num_moe_layers(self) -> int:
+        """Number of layers that own a sparse MoE block (and offload-cache expert slots).
+
+        Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
+        only store experts for the trailing layers; everything else has all layers MoE.
+        """
+        return self.num_layers - self.first_k_dense_replace
+
+    @property
+    def is_multimodal(self) -> bool:
+        return self.vision_config is not None
+
+    @property
+    def has_hybrid_attention(self) -> bool:
+        return len(self.attention_groups) > 1
+
+    @property
+    def has_swa_attention(self) -> bool:
+        return any(isinstance(group, SWAAttentionGroupConfig) for group in self.attention_groups)
+
+    @property
+    def has_linear_attention(self) -> bool:
+        return any(
+            isinstance(group, LinearGatedDeltaGroupConfig)
+            for group in self.attention_groups
+        )
+
+    def default_full_attention_group(self) -> FullAttentionGroupConfig:
+        return FullAttentionGroupConfig(
+            name="full",
+            layer_ids=tuple(range(self.num_layers)),
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            rotary_config=self.rotary_config,
+        )
+
+    def attention_group_for_layer(self, layer_id: int) -> AttentionGroupConfig:
+        groups = self.attention_groups or (self.default_full_attention_group(),)
+        matches = [group for group in groups if group.owns_layer(layer_id)]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Expected exactly one attention group for layer {layer_id}, "
+                f"got {len(matches)}"
+            )
+        return matches[0]
+
+    def swa_attention_group(self) -> SWAAttentionGroupConfig | None:
+        groups = [
+            group
+            for group in self.attention_groups
+            if isinstance(group, SWAAttentionGroupConfig)
+        ]
+        if len(groups) > 1:
+            raise ValueError("Expected at most one SWA attention group")
+        return groups[0] if groups else None
+
+    def linear_attention_group(self) -> LinearGatedDeltaGroupConfig | None:
+        groups = [
+            group
+            for group in self.attention_groups
+            if isinstance(group, LinearGatedDeltaGroupConfig)
+        ]
+        if len(groups) > 1:
+            raise ValueError("Expected at most one linear-gated-delta attention group")
+        return groups[0] if groups else None
+
+    def is_swa_layer(self, layer_id: int) -> bool:
+        return isinstance(self.attention_group_for_layer(layer_id), SWAAttentionGroupConfig)
+
+    def is_linear_layer(self, layer_id: int) -> bool:
+        return isinstance(
+            self.attention_group_for_layer(layer_id),
+            LinearGatedDeltaGroupConfig,
+        )
+
+    def attn_type_for_layer(self, layer_id: int) -> AttnType:
+        """Canonical per-layer attention-type lookup (the taxonomy is declared
+        top-down on the attention groups; this is the layer-granular view)."""
+        group = self.attention_group_for_layer(layer_id)
+        if isinstance(group, LinearGatedDeltaGroupConfig):
+            return AttnType.LINEAR
+        if isinstance(group, SWAAttentionGroupConfig):
+            return AttnType.SWA
+        if isinstance(group, DSV4AttentionGroupConfig):
+            return AttnType.DSV4
+        return _full_group_attn_type(group)
+
+    def kv_cache_group_specs(self) -> Tuple[KVCacheGroupSpec, ...]:
+        if not self.attention_groups:
+            return (
+                KVCacheGroupSpec(
+                    name="full",
+                    layer_ids=tuple(range(self.num_layers)),
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    sliding_window=None,
+                ),
+            )
+
+        specs: list[KVCacheGroupSpec] = []
+        for group in self.attention_groups:
+            if isinstance(group, FullAttentionGroupConfig):
+                specs.append(
+                    KVCacheGroupSpec(
+                        name=group.name,
+                        layer_ids=group.layer_ids,
+                        num_kv_heads=group.num_kv_heads,
+                        head_dim=group.head_dim,
+                        sliding_window=None,
+                        mla=group.mla,
+                        index_head_dim=group.index_head_dim,
+                        num_index_layers=group.num_index_layers,
+                        index_ratio=group.index_ratio,
+                        attn_type=_full_group_attn_type(group),
+                    )
+                )
+            elif isinstance(group, SWAAttentionGroupConfig):
+                specs.append(
+                    KVCacheGroupSpec(
+                        name=group.name,
+                        layer_ids=group.layer_ids,
+                        num_kv_heads=group.num_kv_heads,
+                        head_dim=group.head_dim,
+                        sliding_window=group.sliding_window,
+                        attn_type=AttnType.SWA,
+                    )
+                )
+            elif isinstance(group, DSV4AttentionGroupConfig):
+                # Matrix/taxonomy entry only: DSV4 sizing never reads this spec
+                # (the pool prices itself from dsv4_args), and is_swa/mla stay
+                # False so no generic spec walker treats it as SWA or MLA.
+                specs.append(
+                    KVCacheGroupSpec(
+                        name=group.name,
+                        layer_ids=group.layer_ids,
+                        num_kv_heads=group.num_kv_heads,
+                        head_dim=group.head_dim,
+                        sliding_window=group.sliding_window,
+                        attn_type=AttnType.DSV4,
+                    )
+                )
+        return tuple(specs)
+
+    def kv_cache_groups(self) -> List[Tuple[int, int, int]]:
+        """Return ``[(num_layers, num_kv_heads, head_dim), ...]`` per KV group.
+
+        This legacy memory-accounting helper is derived from the SGLang-style
+        group specs used by hybrid full/SWA KV cache storage.
+        """
+        return [
+            (group.num_layers, group.num_kv_heads, group.head_dim)
+            for group in self.kv_cache_group_specs()
+            if group.num_layers > 0
+        ]
