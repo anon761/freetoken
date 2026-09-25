@@ -3,31 +3,6 @@ from __future__ import annotations
 import torch
 
 
-def build_commit_prep(lens, slots, device):
-    """Layer-invariant tensors for the MTP-verify GDN commit: cumulative accepted lengths,
-    the live GDN slots, and the per-SSM-step active subsets. Built once per round (all GDN
-    layers share it) so the per-layer commit does not repeat host->device copies."""
-    n = len(lens)
-    cu = [0]
-    for n_i in lens:
-        cu.append(cu[-1] + n_i)
-    cu_t = torch.tensor(cu, dtype=torch.int32, device=device)
-    idx_all = torch.tensor(slots, dtype=torch.int32, device=device)
-    has_init = torch.ones(n, dtype=torch.bool, device=device)
-    steps = []
-    for j in range(max(lens) if lens else 0):
-        active = [i for i in range(n) if lens[i] > j]
-        if not active:
-            break
-        sub = torch.tensor(active, dtype=torch.long, device=device)
-        steps.append((
-            sub,
-            idx_all[sub],
-            torch.arange(len(active) + 1, dtype=torch.int32, device=device),
-        ))
-    return cu_t, idx_all, has_init, steps
-
-
 def gdn_prefill_chunk_fla(
     q: torch.Tensor,        # [1, total, num_k_heads, head_k_dim] bf16 (NOT GQA-expanded)
     k: torch.Tensor,        # [1, total, num_k_heads, head_k_dim] bf16
@@ -98,4 +73,49 @@ def gdn_decode_fla(
     return o[0]
 
 
-__all__ = ["gdn_prefill_chunk_fla", "gdn_decode_fla"]
+def gdn_verify_recurrent(
+    q: torch.Tensor,        # [n, t, num_k_heads, head_k_dim] (strided views are fine)
+    k: torch.Tensor,
+    v: torch.Tensor,        # [n, t, num_v_heads, head_v_dim]
+    a: torch.Tensor,        # [n, t, num_v_heads] raw
+    b: torch.Tensor,        # [n, t, num_v_heads] raw
+    *,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_source: torch.Tensor,
+    indices: torch.Tensor,  # [n] int32 live slot per request
+    scale: float,
+) -> torch.Tensor:
+    """MTP verify: the decode recurrence over ``t`` tokens per request, reading the live
+    state but NOT writing it back. Returns ``[n, t, num_v, V]``."""
+    from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update
+
+    return fused_sigmoid_gating_delta_rule_update(
+        A_log=A_log, a=a, dt_bias=dt_bias, softplus_beta=1.0, softplus_threshold=20.0,
+        q=q, k=k, v=v, b=b, initial_state_source=state_source, initial_state_indices=indices,
+        scale=scale, use_qk_l2norm_in_kernel=True, disable_state_update=True,
+    )
+
+
+def gdn_commit_recurrent(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
+    *,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_source: torch.Tensor,
+    indices: torch.Tensor,
+    num_steps: torch.Tensor,  # [n] int32 accepted prefix length per request
+    scale: float,
+) -> None:
+    """MTP commit: advance each live state over its first ``num_steps`` verify tokens (the
+    same recurrence as the verify, so the committed state is exactly the decode state)."""
+    from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update
+
+    fused_sigmoid_gating_delta_rule_update(
+        A_log=A_log, a=a, dt_bias=dt_bias, softplus_beta=1.0, softplus_threshold=20.0,
+        q=q, k=k, v=v, b=b, initial_state_source=state_source, initial_state_indices=indices,
+        scale=scale, use_qk_l2norm_in_kernel=True, num_steps=num_steps,
+    )
+
+
+__all__ = ["gdn_prefill_chunk_fla", "gdn_decode_fla", "gdn_verify_recurrent", "gdn_commit_recurrent"]

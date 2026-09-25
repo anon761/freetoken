@@ -28,6 +28,8 @@ _KNOB_ENVS = (
     "FREETOKEN_MTP_CHAIN",
     "FREETOKEN_MTP_NGRAM",
     "FREETOKEN_MTP_NGRAM_SIZE",
+    "FREETOKEN_MTP_DRAFT_VOCAB",
+    "FREETOKEN_MTP_HEAD_FP8",
 )
 
 
@@ -170,3 +172,9 @@ class TestMtpRuntimeKnobs:
         assert os.environ["FREETOKEN_MTP_CHAIN"] == "1"
         assert os.environ["FREETOKEN_MTP_NGRAM"] == "1"
         assert os.environ["FREETOKEN_MTP_NGRAM_SIZE"] == "5"
+
+    def test_default_on_knobs_can_be_switched_off(self):
+        _parse(["--no-mtp-chain", "--no-mtp-head-fp8", "--mtp-draft-vocab", "0"])
+        assert os.environ["FREETOKEN_MTP_CHAIN"] == "0"
+        assert os.environ["FREETOKEN_MTP_HEAD_FP8"] == "0"
+        assert os.environ["FREETOKEN_MTP_DRAFT_VOCAB"] == "0"

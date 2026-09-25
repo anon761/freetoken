@@ -39,12 +39,14 @@ def _decode_wna16_moe_kernel(
     qw_ptr,            # [S, K//8, N] int32
     qz_ptr,            # [S, K//G, N//8] int32
     sc_ptr,            # [S, K//G, N] fp16
-    c_ptr,             # [M, TOP_K, N] output
+    c_ptr,             # [M, TOP_K, N] output (SPLIT_K == 1)
+    part_ptr,          # [SPLIT_K, M * TOP_K, N] fp32 partials (SPLIT_K > 1)
     topk_weights_ptr,  # [M, TOP_K] fp32
     topk_ids_ptr,      # [M, TOP_K] int32 -> cache slot
     total_routes,
     N,
     K,
+    kb_per,            # K blocks (of BLOCK_SIZE_KW words) per split
     GROUP: tl.constexpr,
     stride_am, stride_ak,
     stride_qe, stride_qkw, stride_qn,
@@ -58,10 +60,12 @@ def _decode_wna16_moe_kernel(
     TOP_K: tl.constexpr,
     A_ROW_IS_ROUTE: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
+    SPLIT_K: tl.constexpr,
     compute_type: tl.constexpr,
 ):
     route_id = tl.program_id(0)
     n_block_id = tl.program_id(1)
+    split_id = tl.program_id(2)
     token_id = route_id // TOP_K
     route_k = route_id - token_id * TOP_K
 
@@ -79,7 +83,8 @@ def _decode_wna16_moe_kernel(
     qw_slot = qw_ptr + slot * stride_qe
     qz_slot = qz_ptr + slot * stride_ze
     sc_slot = sc_ptr + slot * stride_se
-    for kw_start in range(0, tl.cdiv(K_WORDS, BLOCK_SIZE_KW)):
+    kb_end = tl.minimum((split_id + 1) * kb_per, tl.cdiv(K_WORDS, BLOCK_SIZE_KW))
+    for kw_start in range(split_id * kb_per, kb_end):
         widx = kw_start * BLOCK_SIZE_KW + offs_kw
         w_mask = widx < K_WORDS
         word = tl.load(
@@ -105,12 +110,47 @@ def _decode_wna16_moe_kernel(
             acc_w += a_j[:, None] * (code - zero).to(tl.float32)
         accumulator += tl.sum(acc_w * scale, axis=0)
 
+    if SPLIT_K > 1:
+        # deterministic split-K: partials reduced (and weighted) by _decode_wna16_splitk_reduce
+        p_ptrs = part_ptr + (split_id * total_routes + route_id) * N + offs_n
+        tl.store(p_ptrs, accumulator, mask=(route_id < total_routes) & n_mask)
+        return
+
     if MUL_ROUTED_WEIGHT:
         weight = tl.load(topk_weights_ptr + token_id * stride_tw_m + route_k * stride_tw_k)
         accumulator = accumulator * weight
 
     c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
     tl.store(c_ptrs, accumulator.to(compute_type), mask=(route_id < total_routes) & n_mask)
+
+
+@triton.jit
+def _decode_wna16_splitk_reduce(
+    part_ptr,          # [SPLIT_K, total_routes, N] fp32
+    c_ptr,             # [M, TOP_K, N]
+    topk_weights_ptr,  # [M, TOP_K] fp32
+    total_routes,
+    N,
+    stride_cm, stride_ck, stride_cn,
+    stride_tw_m, stride_tw_k,
+    TOP_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    BLOCK: tl.constexpr,
+    compute_type: tl.constexpr,
+):
+    route_id = tl.program_id(0)
+    offs_n = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    n_mask = offs_n < N
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for s in tl.static_range(SPLIT_K):
+        acc += tl.load(part_ptr + (s * total_routes + route_id) * N + offs_n, mask=n_mask, other=0.0)
+    token_id = route_id // TOP_K
+    route_k = route_id - token_id * TOP_K
+    if MUL_ROUTED_WEIGHT:
+        acc = acc * tl.load(topk_weights_ptr + token_id * stride_tw_m + route_k * stride_tw_k)
+    c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
+    tl.store(c_ptrs, acc.to(compute_type), mask=n_mask)
 
 
 @triton.jit
@@ -199,4 +239,4 @@ def _prefill_wna16_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-__all__ = ["_decode_wna16_moe_kernel", "_prefill_wna16_moe_kernel"]
+__all__ = ["_decode_wna16_moe_kernel", "_decode_wna16_splitk_reduce", "_prefill_wna16_moe_kernel"]

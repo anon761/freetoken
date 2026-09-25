@@ -130,35 +130,14 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         batch = get_global_ctx().batch
         return self.lm_head.forward_all(self.model.forward(batch.input_ids))
 
-    def commit_mtp_verify(self, pool, lens, slots) -> None:
-        """Commit the accepted MTP-verify prefix into every GDN layer's live state from
-        the inputs captured during the verify forward (Phase 2, no re-extend)."""
-        from .gdn_kernels import build_commit_prep
-
-        mixers = [
-            mixer
-            for layer in self.model.layers.op_list
-            if (mixer := getattr(layer, "linear_attn", None)) is not None
-        ]
-        # The per-step subsets / cumulative lengths / slots are layer-invariant: build
-        # them ONCE so the GDN layers share the device tensors (the commit is host-bound).
-        prep = None
-        for mixer in mixers:
-            cap = getattr(mixer, "_mtp_capture", None)
-            if cap is not None:
-                prep = build_commit_prep(lens, slots, cap["conv_in"].device)
-                break
-        if prep is None:
-            return
-        self.commit_mtp_verify_prep(pool, prep, lens)
-
-    def commit_mtp_verify_prep(self, pool, prep, lens) -> None:
-        """Captureable commit: run every GDN layer's ``commit_verify`` off a PREBUILT prep
-        (whose live-slot tensor is staged per round), so a CUDA graph can replay it."""
+    def commit_mtp_verify(self, pool, slots, lens) -> None:
+        """Commit the accepted MTP-verify prefix into every GDN layer's live state.
+        ``slots`` [n] int32 live GDN slots, ``lens`` [n] int32 accepted tokens per request
+        (both on device, so a CUDA graph can replay the commit with staged values)."""
         for layer in self.model.layers.op_list:
             mixer = getattr(layer, "linear_attn", None)
             if mixer is not None:
-                mixer.commit_verify(pool, lens, None, prep)
+                mixer.commit_verify(pool, slots, lens)
 
 
 __all__ = ["Qwen3_5MoEForCausalLM"]

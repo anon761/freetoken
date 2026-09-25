@@ -1,70 +1,65 @@
-"""CUDA-graph capture for the MTP GDN commit (Phase 2 follow-up, n=1).
+"""CUDA-graph capture for the MTP GDN commit.
 
-``commit_mtp_verify`` replays the accepted verify prefix into every GDN layer's live conv +
-SSM state via a per-token decode loop: ~2 launches per GDN layer per accepted token, which
-made the commit the round's launch-bound tail (~10 ms). Capture one graph per accepted-token
-count ``a in [1, k+1]`` for the single-request case (the batch=1 deployment); the graph reads
-the SAME static verify-capture buffers and writes the live GDN slot, which is staged into the
-prep's slot tensor before each replay. n > 1 stays eager (the per-request accepted-count
-vector would explode the graph set).
+``commit_mtp_verify`` rewrites every GDN layer's live conv slot and advances its recurrent
+state over the accepted verify prefix: ~3 small kernels per GDN layer, i.e. a launch-bound
+tail when run eagerly. The live slots and accepted lengths are device tensors, so ONE graph
+per padded batch size covers every accepted count; unused rows are padded onto the pool's
+padding slot.
 
-Requires the verify graph (its capture allocates the per-layer ``_mtp_capture`` buffers) and a
-linear_state_pool. Opt-in via ``--mtp-commit-graph`` / ``FREETOKEN_MTP_COMMIT_GRAPH=1``.
+Requires the verify graph (its largest capture allocates the per-layer verify buffers the
+commit reads) and a linear_state_pool. Opt-in via ``--mtp-commit-graph`` /
+``FREETOKEN_MTP_COMMIT_GRAPH=1``.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import torch
 
 
 class CommitGraphRunner:
-    def __init__(self, model, pool, k: int, device: torch.device, stream: torch.cuda.Stream) -> None:
+    def __init__(
+        self, model, pool, bs_list: List[int], t: int, device: torch.device,
+        stream: torch.cuda.Stream,
+    ) -> None:
         self.model = model
         self.pool = pool
-        self.k = k
-        self.device = device
+        self.bs_list = sorted(bs_list)
+        self.n_max = max(self.bs_list)
+        self.t = t
         self.stream = stream
+        self.slots = torch.full((self.n_max,), pool.padding_slot, dtype=torch.int32, device=device)
+        self.lens = torch.full((self.n_max,), t, dtype=torch.int32, device=device)
         self.graphs: Dict[int, torch.cuda.CUDAGraph] = {}
-        self._preps: Dict[int, Tuple] = {}
-        for a in range(1, k + 2):
-            self._capture(a)
+        for bs in self.bs_list:
+            self._capture(bs)
 
-    @staticmethod
-    def _build_prep(a: int, device: torch.device):
-        """n=1 prep: one sequence of ``a`` tokens, its live slot staged into ``idx_all`` (kept
-        as the SAME tensor object the graph reads, so staging a new slot per round works)."""
-        cu_t = torch.tensor([0, a], dtype=torch.int32, device=device)
-        idx_all = torch.zeros(1, dtype=torch.int32, device=device)
-        has_init = torch.ones(1, dtype=torch.bool, device=device)
-        sub = torch.tensor([0], dtype=torch.long, device=device)
-        cu_sub = torch.arange(2, dtype=torch.int32, device=device)
-        steps = [(sub, idx_all, cu_sub) for _ in range(a)]
-        return (cu_t, idx_all, has_init, steps)
+    def _run(self, bs: int) -> None:
+        self.model.commit_mtp_verify(self.pool, self.slots[:bs], self.lens[:bs])
 
-    def _run(self, a: int) -> None:
-        self.model.commit_mtp_verify_prep(self.pool, self._preps[a], [a])
-
-    def _capture(self, a: int) -> None:
-        prep = self._build_prep(a, self.device)
-        prep[1][0] = self.pool.padding_slot  # capture writes a scratch slot, never a real req
-        self._preps[a] = prep
+    def _capture(self, bs: int) -> None:
+        # capture writes the padding slot only (slots are all padding at this point)
         self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream):
-            self._run(a)  # warmup (materialize kernels/allocations)
+            self._run(bs)  # warmup (materialize kernels/allocations)
         torch.cuda.current_stream().wait_stream(self.stream)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=self.stream):
-            self._run(a)
-        self.graphs[a] = graph
+            self._run(bs)
+        self.graphs[bs] = graph
 
-    def can_use(self, n: int, a: int) -> bool:
-        return n == 1 and a in self.graphs
+    def can_use(self, n: int) -> bool:
+        return 0 < n <= self.n_max
 
-    def replay(self, live_slot: int, a: int) -> None:
-        self._preps[a][1][0] = live_slot
-        self.graphs[a].replay()
+    def replay(self, slots: List[int], lens: List[int]) -> None:
+        n = len(slots)
+        bs = next(b for b in self.bs_list if b >= n)
+        self.slots[:bs].fill_(self.pool.padding_slot)
+        self.lens[:bs].fill_(self.t)
+        self.slots[:n].copy_(torch.tensor(slots, dtype=torch.int32))
+        self.lens[:n].copy_(torch.tensor(lens, dtype=torch.int32))
+        self.graphs[bs].replay()
 
 
 __all__ = ["CommitGraphRunner"]

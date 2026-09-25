@@ -15,6 +15,7 @@ import triton
 from freetoken.kernel import moe_sum_reduce_triton
 from freetoken.kernel.triton.wna16_fused_moe import (
     _decode_wna16_moe_kernel,
+    _decode_wna16_splitk_reduce,
     _prefill_wna16_moe_kernel,
     _tl_dtype,
 )
@@ -22,6 +23,26 @@ from freetoken.layers import gated_act_and_mul
 from freetoken.moe.fused import moe_align_block_size
 
 GROUP = 128
+
+
+_DECODE_BLOCK_N = 64
+_DECODE_BLOCK_KW = 8
+_DECODE_TARGET_PROGRAMS = 1600
+
+
+def _decode_config(routes: int, N: int, K: int) -> Dict[str, int]:
+    """Tiles for the route-parallel decode kernel (M x top_k routes, one expert each).
+
+    A decode step has few routes, so narrow single-warp programs plus a deterministic
+    split-K fill the SMs; the split grows until ~_DECODE_TARGET_PROGRAMS. RTX 3090,
+    Qwen3.8-Flash-Next per rank (gate_up 640x2560, down 2560x320), M=1 / M=4: gate_up
+    43 -> 19 / 170 -> 56 us, down 28 -> 10 / 91 -> 29 us."""
+    programs = routes * triton.cdiv(N, _DECODE_BLOCK_N)
+    n_kb = triton.cdiv(K // 8, _DECODE_BLOCK_KW)
+    split = max(1, min(8, n_kb, _DECODE_TARGET_PROGRAMS // max(1, programs)))
+    split = 1 << (split.bit_length() - 1)
+    return dict(BLOCK_SIZE_N=_DECODE_BLOCK_N, BLOCK_SIZE_KW=_DECODE_BLOCK_KW,
+                num_warps=1, num_stages=2, SPLIT_K=split)
 
 
 def _decode_gemm(
@@ -34,15 +55,23 @@ def _decode_gemm(
     topk_ids: torch.Tensor,
     mul_routed_weight: bool,
     a_row_is_route: bool,
+    cfg: Dict[str, int] | None = None,
 ) -> None:
     M, top_k = topk_ids.shape
     N = qw.shape[2]
     K = qw.shape[1] * 8
     total_routes = M * top_k
-    grid = (total_routes, triton.cdiv(N, 64))
+    cfg = dict(cfg or _decode_config(total_routes, N, K))
+    split = cfg.pop("SPLIT_K")
+    n_kb = triton.cdiv(K // 8, cfg["BLOCK_SIZE_KW"])
+    split = max(1, min(split, n_kb))
+    kb_per = triton.cdiv(n_kb, split)
+    part = (torch.empty((split, total_routes, N), device=a.device, dtype=torch.float32)
+            if split > 1 else c)  # unused dummy when split == 1
+    grid = (total_routes, triton.cdiv(N, cfg["BLOCK_SIZE_N"]), split)
     _decode_wna16_moe_kernel[grid](
-        a, qw, qz, sc, c, topk_weights, topk_ids,
-        total_routes, N, K, GROUP,
+        a, qw, qz, sc, c, part, topk_weights, topk_ids,
+        total_routes, N, K, kb_per, GROUP,
         a.stride(0), a.stride(1),
         qw.stride(0), qw.stride(1), qw.stride(2),
         qz.stride(0), qz.stride(1), qz.stride(2),
@@ -50,14 +79,21 @@ def _decode_gemm(
         c.stride(0), c.stride(1), c.stride(2),
         topk_weights.stride(0), topk_weights.stride(1),
         topk_ids.stride(0), topk_ids.stride(1),
-        BLOCK_SIZE_N=64,
-        BLOCK_SIZE_KW=64,
         TOP_K=top_k,
         A_ROW_IS_ROUTE=a_row_is_route,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
+        SPLIT_K=split,
         compute_type=_tl_dtype(c.dtype),
-        num_warps=4,
+        **cfg,
     )
+    if split > 1:
+        _decode_wna16_splitk_reduce[(total_routes, triton.cdiv(N, 256))](
+            part, c, topk_weights, total_routes, N,
+            c.stride(0), c.stride(1), c.stride(2),
+            topk_weights.stride(0), topk_weights.stride(1),
+            TOP_K=top_k, SPLIT_K=split, MUL_ROUTED_WEIGHT=mul_routed_weight,
+            BLOCK=256, compute_type=_tl_dtype(c.dtype), num_warps=2,
+        )
 
 
 def _prefill_config(M: int) -> Dict[str, int]:

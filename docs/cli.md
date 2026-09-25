@@ -99,6 +99,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 |---|---|---|
 | `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile. `--moe-backend` is the deprecated old spelling |
 | `--quant-backend` | auto | Kernel per quantized layer type, `layer[.kind]=name` entries: `linear=marlin,moe=b12x` or `moe.nvfp4=triton`. A layer-level entry applies to every kind whose table lists the name |
+| `--[no-]dense-fp8` | off | Quantize the bf16 dense linears (attention, GDN, shared experts, lm_head; routers stay bf16) to fp8 per row at load: W8A16, about half the dense weight traffic. Flash-Next plain decode +25-31 % |
 | `--nvfp4-backend` | — | Deprecated: stands in for `--quant-backend moe.nvfp4=<marlin\|b12x\|triton>` (`flashinfer` means b12x); cannot be combined with `--quant-backend` |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family strategies) |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
@@ -123,10 +124,13 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--mtp` | auto | Draft head. `auto` follows `FREETOKEN_ENABLE_MTP`; `on` serves the draft embedded in the base checkpoint; `off` forces it off; `file` loads a standalone artifact from `--mtp-header`. `on`/`file` also disable overlap scheduling (Phase 1 needs the drain-safe non-overlap loop) |
+| `--mtp` | auto | Draft head. `auto` follows `FREETOKEN_ENABLE_MTP`; `on` serves the draft embedded in the base checkpoint; `off` forces it off; `file` loads a standalone artifact from `--mtp-header`. |
 | `--mtp-header` | — | Standalone draft-head artifact: a directory (`config.json` + `*.safetensors`) or a single `.safetensors` with its `config.json` next to it. Used with `--mtp file` |
 | `--mtp-path` | — | Deprecated alias for `--mtp file --mtp-header PATH` |
 | `--mtp-draft-tokens` | 3 | Draft chain length k (k+1 must stay inside one GDN chunk) |
+| `--[no-]mtp-chain` | on | Chain MTP rounds back-to-back instead of alternating a plain decode step |
+| `--mtp-draft-vocab` | 32768 | Draft argmax over the N most frequently generated tokens (learned from the served traffic); 0 = full vocab |
+| `--[no-]mtp-head-fp8` | on | Quantize the bf16 MTP draft head to fp8 per row at load |
 | `--dspark-verify` | decode | DeepSeek-V4.1 DSpark verify path: `decode` aligns the attention reduction with plain decode; `prefill` keeps the ascending-window extend. Inert without the DSpark draft head |
 | `--dspark-k` | draft block size | DSpark draft chain length |
 

@@ -89,8 +89,8 @@ class DraftGraphRunner:
         attn_backend: "BaseAttnBackend",
         bs_list: List[int],
         width: int,
-        vocab_size: int,
         device: torch.device,
+        draft_vocab=None,
     ) -> None:
         self.gr = graph_runner
         self.model = model
@@ -98,12 +98,14 @@ class DraftGraphRunner:
         self.mtp = model.mtp
         self.embed = model.model.embed_tokens.forward
         self.lm_head = model.lm_head
+        self.draft_vocab = draft_vocab
         self.bs_list = sorted(bs_list)
         self.n_max = max(self.bs_list)
         self.width = width
         self.device = device
         self.dummy_table_idx = graph_runner.dummy_req.table_idx
-        self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        # (padded bs, draft-vocab subset head?) -> graph
+        self.graph_map: Dict[Tuple[int, bool], torch.cuda.CUDAGraph] = {}
         # Private memory pool: the draft graphs must NOT share the decode/verify pool, or a
         # replay of one overwrites the other's baked transients.
         self.pool = None
@@ -114,7 +116,7 @@ class DraftGraphRunner:
         self.out_loc = torch.zeros(self.n_max, dtype=torch.int32, device=device)
         # The MTP block's output stream is the resident bf16 draft dtype.
         self.R_out = torch.empty(self.n_max, width, dtype=torch.bfloat16, device=device)
-        self.logits = torch.empty(self.n_max, vocab_size, dtype=torch.float32, device=device)
+        self.draft_ids = torch.zeros(self.n_max, dtype=torch.int32, device=device)
         # Padding rows: position 0 and the dummy page's slot (safe no-op writes).
         self.pad_positions = torch.zeros(self.n_max, dtype=torch.int32, device=device)
         self.pad_out_loc = (
@@ -129,12 +131,17 @@ class DraftGraphRunner:
         from freetoken.kernel.fla.utils import pin_all_tensor_caches
 
         pin_all_tensor_caches()
-        self.max_kv = getattr(attn_backend, "graph_extend_max_kv", None)
         logger.info_rank0(f"MTP draft CUDA graphs captured: bs={self.bs_list}")
 
     # ------------------------------------------------------------------ capture
 
     def _capture(self, bs: int) -> None:
+        # one graph per head variant: the full-vocab argmax and, when a draft vocab is
+        # configured, the subset argmax (chosen per round by whether the set is active)
+        for subset in (False, True) if self.draft_vocab is not None else (False,):
+            self._capture_variant(bs, subset)
+
+    def _capture_variant(self, bs: int, subset: bool) -> None:
         dummy = self.gr.dummy_req
         reqs = [_DraftReq(dummy.table_idx, 0, 1) for _ in range(bs)]
         self.positions[:bs] = self.pad_positions[:bs]
@@ -148,37 +155,36 @@ class DraftGraphRunner:
         with self.attn.draft_scratch():
             sb.attn_metadata = self.attn.make_draft_metadata()
             with get_global_ctx().forward_batch(sb):
-                self._forward(bs, sb)  # eager warmup (materializes scratch)
+                self._forward(bs, sb, subset)  # eager warmup (materializes scratch)
                 # The MTP block is the only QSA layer here, so qsa_forward's slot-0
                 # ``_plan_index_writes`` guard does not fire during capture; clear the
                 # warmup plan so the per-step index computation is captured (its stale
                 # warmup rows would otherwise be replayed against real geometry).
                 sb.attn_metadata.cmp_rows = None
                 with torch.cuda.graph(graph, pool=self.pool, stream=self.gr.stream):
-                    self._forward(bs, sb)
-        self.graph_map[bs] = graph
+                    self._forward(bs, sb, subset)
+        self.graph_map[(bs, subset)] = graph
         if self.pool is None:
             self.pool = graph.pool()  # reuse this graph's mempool for the remaining sizes
 
-    def _forward(self, bs: int, sb: _DraftBatch) -> None:
+    def _forward(self, bs: int, sb: _DraftBatch, subset: bool) -> None:
         R_next, sample_hidden = self.mtp.draft_step(
             self.embed, self.R_in[:bs], self.token_in[:bs], sb
         )
         self.R_out[:bs].copy_(R_next)
-        # forward_all, NOT forward: the draft batch is phase="prefill", and forward's
-        # last-row gather (``x = x[attn_metadata.last_indices]``) indexes a capture-time
-        # temporary that is freed once the capture returns, so replaying the graph read
-        # freed memory -> device-side OOB. At t=1 every row IS the last row, so
-        # forward_all returns the same logits the draft chain needs.
-        self.logits[:bs] = self.lm_head.forward_all(sample_hidden)
+        # All rows, NOT forward: the draft batch is phase="prefill", and forward's last-row
+        # gather (``x = x[attn_metadata.last_indices]``) indexes a capture-time temporary
+        # that is freed once the capture returns (device-side OOB on replay). At t=1 every
+        # row IS the last row.
+        if subset:
+            self.draft_ids[:bs] = self.draft_vocab.argmax(sample_hidden)
+        else:
+            self.draft_ids[:bs] = self.lm_head.forward_argmax(sample_hidden)
 
     # ------------------------------------------------------------------ replay
 
-    def can_use(self, n: int, max_kv: int | None = None) -> bool:
-        return (
-            0 < n <= self.n_max
-            and (max_kv is None or self.max_kv is None or max_kv <= self.max_kv)
-        )
+    def can_use(self, n: int) -> bool:
+        return 0 < n <= self.n_max
 
     def _select_bs(self, n: int) -> int:
         return next(bs for bs in self.bs_list if bs >= n)
@@ -192,9 +198,10 @@ class DraftGraphRunner:
         out_loc: torch.Tensor,
         R_in: torch.Tensor,
         tokens: torch.Tensor,
+        subset: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Stage one draft step's geometry + inputs into the static buffers and replay the
-        smallest captured size ``>=`` the request count. Returns ``(R_next[:n], logits[:n])``."""
+        smallest captured size ``>=`` the request count. Returns ``(R_next[:n], draft ids[:n])``."""
         n = len(table_idx)
         assert self.can_use(n), f"draft n={n} outside captured range (max {self.n_max})"
         bs = self._select_bs(n)
@@ -208,8 +215,8 @@ class DraftGraphRunner:
         self.out_loc[:n].copy_(out_loc)
         self.attn.set_draft_n(bs)
         self.attn.stage_draft_round(list(table_idx), list(kvlen), pad_table_idx=self.dummy_table_idx)
-        self.graph_map[bs].replay()
-        return self.R_out[:n], self.logits[:n]
+        self.graph_map[(bs, subset)].replay()
+        return self.R_out[:n], self.draft_ids[:n]
 
 
 __all__ = ["DraftGraphRunner"]

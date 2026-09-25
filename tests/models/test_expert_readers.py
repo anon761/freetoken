@@ -179,7 +179,7 @@ def test_nvfp4_reader_accepts_the_text_only_root(tmp_path):
     ``model.language_model.`` segment: the expert reader must resolve the same canonical
     pieces under the bare ``model.`` root, while the MTP head's experts stay excluded."""
     from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
-    from freetoken.models.qwen4_exp.weight import _EXPERT_KEY_RE, _NVFP4_SOURCE_SPEC
+    from freetoken.models.qwen4_exp.weight import _NVFP4_CT_SOURCE_SPEC, _NVFP4_SOURCE_SPEC
 
     tensors = {}
     for e in range(E):
@@ -192,4 +192,37 @@ def test_nvfp4_reader_accepts_the_text_only_root(tmp_path):
 
     pieces = list(iter_nvfp4_expert_pieces(str(tmp_path), _config(), _NVFP4_SOURCE_SPEC, parallel=False))
     assert [p[1:3] for p in pieces] == [(0, 1), (1, 2)]
-    assert _EXPERT_KEY_RE.match("mtp.layers.0.mlp.experts.0.gate_proj.weight") is None
+    for spec in (_NVFP4_SOURCE_SPEC, _NVFP4_CT_SOURCE_SPEC):
+        assert spec.key_pattern.match("mtp.layers.0.mlp.experts.0.gate_proj.weight") is None
+        assert spec.key_pattern.match("mtp.layers.0.mlp.experts.0.gate_proj.weight_packed") is None
+
+
+def test_nvfp4_reader_inverts_the_compressed_tensors_global(tmp_path, monkeypatch):
+    """llm-compressor stores the QUANT-side global (``weight_global_scale``, ~1e4); the banks
+    need the dequant-side one like modelopt's ``weight_scale_2`` (~1e-4). Taken as-is the
+    experts come out ~1e8x too large (Flash-Next-Uncensored-NVFP4 decoded only token 0)."""
+    from types import SimpleNamespace
+
+    from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
+    from freetoken.models.qwen4_exp import weight as qw
+
+    tensors = {}
+    for e in range(E):
+        for proj, out, inn in (("gate_proj", I, H), ("up_proj", I, H), ("down_proj", H, I)):
+            base = f"model.language_model.layers.0.mlp.experts.{e}.{proj}"
+            tensors[base + ".weight_packed"] = torch.zeros(out, inn // 2, dtype=torch.uint8)
+            tensors[base + ".weight_scale"] = torch.ones(out, inn // 16, dtype=torch.float8_e4m3fn)
+            tensors[base + ".weight_global_scale"] = torch.tensor([4.0])
+    _write(tmp_path, tensors)
+
+    for method, spec in (("compressed-tensors", qw._NVFP4_CT_SOURCE_SPEC), ("modelopt", qw._NVFP4_SOURCE_SPEC)):
+        hf = SimpleNamespace(quantization_config={"quant_method": method})
+        monkeypatch.setattr(qw, "cached_load_hf_config", lambda path, hf=hf: hf)
+        assert qw.nvfp4_expert_spec(str(tmp_path), _config()) is spec
+
+    pieces = list(iter_nvfp4_expert_pieces(str(tmp_path), _config(), qw._NVFP4_CT_SOURCE_SPEC, parallel=False))
+    assert [p[1:3] for p in pieces] == [(0, 1), (1, 2)]
+    for _layer, _e0, _e1, piece in pieces:
+        for role in ("gate", "up", "down"):
+            assert piece[role + "_global"].dtype is torch.float16
+            assert torch.all(piece[role + "_global"] == 0.25)

@@ -170,6 +170,96 @@ def _gemv(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
 
 
 # ======================================================================================
+# Small-M (2..16) split-K W8A16 GEMM: batched decode / MTP verify. Like the GEMV, every
+# weight tile is read ONCE and the grid spans the SMs through split-K; the M rows share it
+# through one tensor-core dot (rows padded to 16).
+# ======================================================================================
+_SMALL_M_MAX = 16
+# Tuned on RTX 3090 (sm86, W8A16) over Qwen3.8-27B's fp8 shapes under CUDA graphs: M=4 runs
+# at ~700-850 GB/s, the M=1 GEMV's cost (the tiled GEMM below: 250-450 GB/s).
+_SMALL_M_BLOCK_N = 32
+_SMALL_M_BLOCK_K = 128
+_SMALL_M_TARGET_PROGRAMS = 512
+
+
+@triton.jit
+def _gemm_smallm_splitk_kernel(
+    a_ptr, w_ptr, part_ptr, M, N, K, n_kb, kb_per,
+    stride_am, stride_ak, stride_wn, stride_wk, stride_pk, stride_pm, stride_pn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    kb_start = pid_k * kb_per
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for i in range(kb_per):
+        kb = kb_start + i
+        if kb < n_kb:
+            offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K
+            a = tl.load(
+                a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak,
+                mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+            )
+            w_ptrs = w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+            w_mask = n_mask[:, None] & k_mask[None, :]
+            if e4m3_native_cx():
+                w = tl.load(w_ptrs, mask=w_mask, other=0.0).to(a.dtype)
+            else:
+                w = e4m3_u8_to_f32(tl.load(w_ptrs, mask=w_mask, other=0)).to(a.dtype)
+            acc += tl.dot(a, tl.trans(w), out_dtype=tl.float32)
+    tl.store(
+        part_ptr + pid_k * stride_pk + offs_m[:, None] * stride_pm + offs_n[None, :] * stride_pn,
+        acc, mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
+@triton.jit
+def _splitk_reduce_2d_kernel(
+    part_ptr, scale_ptr, out_ptr, M, N, SPLIT_K: tl.constexpr,
+    stride_pk, BLOCK: tl.constexpr, OUT: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)  # flat over the contiguous [M, N]
+    mask = offs < M * N
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for k in tl.static_range(SPLIT_K):
+        acc += tl.load(part_ptr + k * stride_pk + offs, mask=mask, other=0.0)
+    scale = tl.load(scale_ptr + offs % N, mask=mask, other=0.0).to(tl.float32)
+    tl.store(out_ptr + offs, (acc * scale).to(OUT), mask=mask)
+
+
+def _gemm_smallm(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+                 out_dtype: torch.dtype) -> torch.Tensor:
+    """2 <= M <= 16 W8A16 GEMM. ``a`` [M, K] bf16; ``weight`` [N, K] fp8; ``weight_scale`` [N]."""
+    M, K = a.shape
+    N = weight.shape[0]
+    n_kb = triton.cdiv(K, _SMALL_M_BLOCK_K)
+    n_tiles = triton.cdiv(N, _SMALL_M_BLOCK_N)
+    split_k = max(1, min(_SMALL_M_TARGET_PROGRAMS // n_tiles, n_kb))
+    split_k = 1 << (split_k.bit_length() - 1)  # pow2 -> stable reduction order
+    kb_per = triton.cdiv(n_kb, split_k)
+    part = torch.empty((split_k, M, N), dtype=torch.float32, device=a.device)
+    _gemm_smallm_splitk_kernel[(n_tiles, split_k)](
+        a, weight, part, M, N, K, n_kb, kb_per,
+        a.stride(0), a.stride(1), weight.stride(0), weight.stride(1),
+        part.stride(0), part.stride(1), part.stride(2),
+        BLOCK_M=16, BLOCK_N=_SMALL_M_BLOCK_N, BLOCK_K=_SMALL_M_BLOCK_K, num_warps=4,
+        num_stages=2,
+    )
+    compute = out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16
+    out = torch.empty((M, N), dtype=compute, device=a.device)
+    _splitk_reduce_2d_kernel[(triton.cdiv(M * N, 512),)](
+        part, weight_scale, out, M, N, split_k, part.stride(0),
+        BLOCK=512, OUT=_TL_DTYPE[compute], num_warps=4,
+    )
+    return out
+
+
+# ======================================================================================
 # Prefill (M>1) W8A16 GEMM: fp8 weight read from HBM, upcast to bf16 in-register for the
 # tensor-core dot (fp8 e4m3 -> bf16 is lossless), per-row scale applied after accumulation.
 # ======================================================================================
@@ -327,7 +417,10 @@ def fp8_pertensor_linear(
     GEMV at M=1, GEMM above it). Picking per-M would make a request's numerics depend on how
     many unrelated requests happened to be in flight, so a reply would not reproduce at bs=1 --
     and W8A16 at M=1 is worth only ~0.5% (5.53 ms vs 5.56 ms of per-step GEMM) anyway. vLLM and
-    SGLang likewise run one scheme across all M on any GPU with FP8 tensor cores."""
+    SGLang likewise run one scheme across all M on any GPU with FP8 tensor cores.
+
+    W8A16 dispatch: split-K GEMV at M=1, split-K small-M GEMM at M<=16 (batched decode, MTP
+    verify), the tiled GEMM above."""
     *lead, K = x.shape
     N = weight.shape[0]
     w8a8 = input_scale is not None and e4m3_native()
@@ -343,6 +436,10 @@ def fp8_pertensor_linear(
         ).reshape(*lead, N)
     elif x.numel() // K == 1:
         out = _gemv(x.reshape(K), e4m3_kernel_view(weight), weight_scale, x.dtype).reshape(*lead, N)
+    elif x.numel() // K <= _SMALL_M_MAX:
+        out = _gemm_smallm(
+            x.reshape(-1, K), e4m3_kernel_view(weight), weight_scale, x.dtype,
+        ).reshape(*lead, N)
     else:
         out = _gemm(
             x.reshape(-1, K), e4m3_kernel_view(weight), weight_scale, x.dtype,

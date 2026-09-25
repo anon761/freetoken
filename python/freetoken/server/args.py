@@ -47,7 +47,6 @@ _ENV_FLAG_ENABLE = {
     "mtp_draft_graph": "FREETOKEN_MTP_DRAFT_GRAPH",
     "mtp_commit_graph": "FREETOKEN_MTP_COMMIT_GRAPH",
     "mtp_sampled": "FREETOKEN_MTP_SAMPLED",
-    "mtp_chain": "FREETOKEN_MTP_CHAIN",
     "mtp_ngram": "FREETOKEN_MTP_NGRAM",
 }
 _ENV_FLAG_DISABLE = {
@@ -65,10 +64,14 @@ _ENV_FLAG_BOOL = {
     "glm_dsa": "FREETOKEN_GLM_DSA",
     "glm5_dsa": "FREETOKEN_GLM5_DSA",
     "moe_verify_cpu": "FREETOKEN_MOE_VERIFY_CPU",
+    "mtp_chain": "FREETOKEN_MTP_CHAIN",
+    "mtp_head_fp8": "FREETOKEN_MTP_HEAD_FP8",
+    "dense_fp8": "FREETOKEN_DENSE_FP8",
 }
 _ENV_FLAG_VALUE = {
     "mtp_draft_tokens": "FREETOKEN_MTP_DRAFT_TOKENS",
     "mtp_ngram_size": "FREETOKEN_MTP_NGRAM_SIZE",
+    "mtp_draft_vocab": "FREETOKEN_MTP_DRAFT_VOCAB",
     "dspark_k": "FREETOKEN_DSPARK_K",
     "mamba_ssm_dtype": "FREETOKEN_MAMBA_SSM_DTYPE",
     "pin_budget_gb": "FREETOKEN_PIN_BUDGET_GB",
@@ -132,6 +135,9 @@ class ServerArgs(SchedulerConfig):
     # "model": fill unspecified request sampling params from generation_config.json
     # (temperature/top_k/top_p), like sglang. "none": use framework defaults only.
     sampling_defaults: str = "model"
+    # Serve every request greedily (temperature=0), overriding client-supplied sampling.
+    # Enables the greedy-only MTP path for sampled clients; changes their outputs.
+    force_greedy: bool = False
     # Default max output (decode) tokens for a request that omits one. None falls back to the
     # adapter's built-in default (32k).
     max_output_tokens: int | None = None
@@ -593,6 +599,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--force-greedy",
+        action="store_true",
+        default=ServerArgs.force_greedy,
+        help=(
+            "Serve every request greedily (temperature=0), overriding client-supplied "
+            "sampling. Enables the greedy-only MTP path for sampled clients; changes "
+            "their outputs."
+        ),
+    )
+
+    parser.add_argument(
         "--served-model-name",
         type=str,
         default=ServerArgs.served_model_name,
@@ -711,8 +728,21 @@ def parse_args(
                         help="Replay the GDN commit from a captured CUDA graph (single-request; needs --mtp-verify-graph).")
     parser.add_argument("--mtp-sampled", action="store_true", default=None, dest="mtp_sampled",
                         help="Enable MTP for sampled requests via rejection sampling (default off).")
-    parser.add_argument("--mtp-chain", action="store_true", default=None, dest="mtp_chain",
-                        help="Chain MTP rounds back-to-back instead of alternating a plain decode step.")
+    parser.add_argument("--mtp-chain", action=argparse.BooleanOptionalAction, default=None,
+                        dest="mtp_chain",
+                        help="Chain MTP rounds back-to-back instead of alternating a plain decode "
+                             "step (default on).")
+    parser.add_argument("--mtp-draft-vocab", type=int, default=None, dest="mtp_draft_vocab",
+                        help="Draft argmax over the N most frequently generated tokens instead of "
+                             "the whole vocab (default 32768; 0 = full vocab).")
+    parser.add_argument("--dense-fp8", action=argparse.BooleanOptionalAction, default=None,
+                        dest="dense_fp8",
+                        help="Quantize the model's bf16 linears (routers excepted) to fp8 per "
+                             "row at load: faster bandwidth-bound decode, fp8 weight rounding "
+                             "(default off).")
+    parser.add_argument("--mtp-head-fp8", action=argparse.BooleanOptionalAction, default=None,
+                        dest="mtp_head_fp8",
+                        help="Quantize the bf16 MTP draft head to fp8 per row at load (default on).")
     parser.add_argument("--mtp-ngram", action="store_true", default=None, dest="mtp_ngram",
                         help="Override the MTP draft chain with a self-history n-gram match when it repeats.")
     parser.add_argument("--mtp-ngram-size", type=int, default=None, dest="mtp_ngram_size",

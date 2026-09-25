@@ -76,19 +76,20 @@ _GEMM_BLOCK_SMEM = 36 << 10
 _GEMM_WAVE: dict = {}
 
 
-def _gemm_wave(device: torch.device) -> int:
+def _gemm_wave(device: torch.device) -> tuple[int, int]:
+    """``(wave, resident blocks per SM)`` of the M <= 16 dot GEMM on ``device``."""
     idx = device.index if device.index is not None else torch.cuda.current_device()
-    wave = _GEMM_WAVE.get(idx)
-    if wave is None:
+    cached = _GEMM_WAVE.get(idx)
+    if cached is None:
         props = torch.cuda.get_device_properties(idx)
         blocks = max(1, min(
             props.regs_per_multiprocessor // _GEMM_BLOCK_REGS,
             props.shared_memory_per_multiprocessor // _GEMM_BLOCK_SMEM,
             4,
         ))
-        wave = props.multi_processor_count * blocks
-        _GEMM_WAVE[idx] = wave
-    return wave
+        cached = (props.multi_processor_count * blocks, blocks)
+        _GEMM_WAVE[idx] = cached
+    return cached
 
 # Above this M the dequant-to-scratch + cuBLAS path wins (the in-K dot GEMM re-dequants
 # each weight tile M/BLOCK_M times; cuBLAS is ~4x its per-tile FLOP efficiency).
@@ -520,7 +521,7 @@ def _nvfp4_gemm_splitk_reduce_kernel(
     tl.store(out_ptr + pid_m * stride_om + offs * stride_on, (acc * g).to(OUT), mask=mask)
 
 
-def _pick_split_k_bm16(num_mn: int, num_tiles: int, wave: int) -> int:
+def _pick_split_k_bm16(num_mn: int, num_tiles: int, wave: int, blocks_per_sm: int = 4) -> int:
     """Split-K for the M <= 16 (decode-batch) grid. At these M the op is pure weight
     streaming, so the grid must reach ~one wave of blocks (``wave`` = SM count x resident
     blocks/SM, see :func:`_gemm_wave`) before bandwidth saturates -- but each program
@@ -534,6 +535,18 @@ def _pick_split_k_bm16(num_mn: int, num_tiles: int, wave: int) -> int:
     split_k = 1
     while split_k * 2 <= max_sk and num_mn * split_k < min_grid:
         split_k *= 2
+    if blocks_per_sm <= 2:
+        # smem-bound consumer parts (RTX 3090/4090/5090): with 2 blocks/SM a mostly-empty
+        # tail wave idles the SMs for a whole program, so deepen the split until the tail
+        # wave is >= 80% full while programs keep >= 8 K-tiles. RTX 3090, Qwen3.8-27B MLP
+        # at M=4: gate_up 88 -> 75 us (split 2 -> 4), down 46 -> 38 us (8 -> 4).
+        while True:
+            tail = (num_mn * split_k) % wave
+            if tail == 0 or tail >= 0.8 * wave:
+                return split_k
+            if split_k * 2 > max_sk or num_tiles < 8 * split_k * 2:
+                return split_k
+            split_k *= 2
     # A grid within ~15% of exactly one wave quantizes badly (one full wave + a tiny
     # straggler wave of full-length programs); take 2 waves when K can afford it.
     blocks = num_mn * split_k
@@ -562,7 +575,7 @@ def _gemm_inkernel(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tenso
     num_mn = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
     num_tiles = triton.cdiv(K_WORDS, _GEMM_BLOCK_KW)
     if BLOCK_M == 16:
-        split_k = _pick_split_k_bm16(num_mn, num_tiles, _gemm_wave(a.device))
+        split_k = _pick_split_k_bm16(num_mn, num_tiles, *_gemm_wave(a.device))
     else:
         split_k = max(1, min(_GEMM_SPLITK_TARGET // max(num_mn, 1), num_tiles))
         split_k = 1 << (split_k.bit_length() - 1)

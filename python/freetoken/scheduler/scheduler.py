@@ -67,6 +67,7 @@ class _NoopMTP:
     enabled = False
     k = 0
     uses_streams = False
+    overlaps = True
     _deferred: set = set()
 
     def run_round(self) -> None: ...
@@ -265,7 +266,8 @@ class Scheduler(SchedulerIOMixin):
         request that became ineligible (near its output budget, or its streams were cleared)
         must be let through to a plain decode -- a stale ``_deferred`` entry would filter it
         out of every decode batch and starve it forever (the classic chain hang)."""
-        if ENV.MTP_CHAIN:
+        # chaining is the MTPManager's round shape; the no-op and DSpark managers keep their own
+        if ENV.MTP_CHAIN and mtp.enabled and isinstance(mtp, MTPManager):
             mtp._deferred = {
                 r for r in self.decode_manager.running_reqs if mtp.eligible(r)
             }
@@ -474,7 +476,7 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        if not self._overlap_enabled():
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -484,6 +486,12 @@ class Scheduler(SchedulerIOMixin):
             data = None
             while True:
                 data = self.overlap_loop(data)
+
+    def _overlap_enabled(self) -> bool:
+        """The overlap loop, unless the env forces the drain-safe loop or the speculative
+        manager has no split round (DSpark runs its whole round inside normal_loop)."""
+        mtp = getattr(self, "mtp", None) or _NOOP_MTP
+        return not ENV.DISABLE_OVERLAP_SCHEDULING and mtp.overlaps
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)

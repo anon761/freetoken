@@ -3,8 +3,8 @@
 One round per scheduler iteration. The round is split so ``overlap_loop`` can make the
 verify the overlapped batch (Phase 4):
 
-* ``begin_round`` -- grow the ids / allocate the verify window, run the draft chain,
-  snapshot the GDN state and LAUNCH the verify asynchronously;
+* ``begin_round`` -- grow the ids / allocate the verify window, run the draft chain and
+  LAUNCH the verify asynchronously;
 * drain the previous batch on the host (this is the overlap window);
 * ``finish_round`` -- accept, publish, roll back rejected pages and commit the accepted
   prefix into the live conv + SSM slots.
@@ -28,10 +28,10 @@ Round shape:
    bonus token is the argmax at the last accepted position (greedy) or a sample from
    the target / residual distribution (sampled).
 4. Publish accepted drafts + bonus (EOS / stop-string / length checks per token),
-   roll back the rejected pages (``CacheManager.rollback_last``), restore the GDN
-   state to the pre-verify boundary and commit the accepted prefix into the live
-   conv + SSM slots (``commit_mtp_verify``, Phase 2 -- no full-model re-extend), so
-   the next round starts from a clean, uniform entry state.
+   roll back the rejected pages (``CacheManager.rollback_last``) and commit the
+   accepted prefix into the live conv + SSM slots (``commit_mtp_verify``; the verify
+   leaves the recurrent state untouched, see ``gdn_verify``), so the next round starts
+   from a clean, uniform entry state.
 """
 
 from __future__ import annotations
@@ -52,12 +52,6 @@ if TYPE_CHECKING:
     from .scheduler import Scheduler
 
 logger = init_logger(__name__)
-
-# The GDN chunk kernel only materializes state at x64 boundaries; a verify extend
-# must stay inside ONE chunk so the in-place state advance is confined to a single
-# snapshot/restore window (see _GDN_CHUNK in attention/linear.py).
-_GDN_CHUNK = 64
-
 
 class _DraftReq:
     """Minimal request view for synthetic draft batches. The QSA backend's metadata
@@ -131,8 +125,6 @@ class _RoundState(NamedTuple):
     verify_streams: Optional[torch.Tensor]
     drafts_gpu: List[torch.Tensor]
     anchor_toks: torch.Tensor
-    hybrid: bool
-    scratch: List[int]
     pool: object
     moe: object
     timing: bool
@@ -142,6 +134,8 @@ class MTPManager:
     # qwen4-exp MTP carries per-request residual streams (`req.mtp_streams_row`) that the
     # scheduler must refresh every decode step; DSpark does not (uses the target aux buffer).
     uses_streams = True
+    # begin_round/finish_round let the verify be the overlapped batch (Phase 4)
+    overlaps = True
 
     def __init__(self, sched: "Scheduler") -> None:
         self.sched = sched
@@ -157,9 +151,11 @@ class MTPManager:
             )
             return
         self.k = max(1, ENV.MTP_DRAFT_TOKENS.value)
-        assert self.k + 1 < _GDN_CHUNK, (
-            f"MTP verify extends must stay inside one GDN chunk ({_GDN_CHUNK})"
-        )
+        from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+        # A verify extend of >= CHUNK_SIZE+1 tokens would get hybrid-radix track metadata
+        # (attention/linear.py) that the decode-exact GDN verify never writes.
+        assert self.k + 1 <= CHUNK_SIZE, f"MTP k+1 must stay within one GDN chunk ({CHUNK_SIZE})"
         self.embed = model.model.embed_tokens.forward
         self.lm_head = model.lm_head
         # Stream width of the draft input: qwen4-exp carries hyper-connection streams
@@ -262,6 +258,9 @@ class MTPManager:
             offsets[i + 1] = offsets[i] + (e - s)
         if not seg_reqs:
             return
+        dv = getattr(eng, "draft_vocab", None)
+        if dv is not None:
+            dv.observe(toks, generated=False)
         tables = torch.tensor([q.table_idx for q in seg_reqs], dtype=torch.int64, device=eng.device)
         seg_lens = torch.tensor([q.extend_len for q in seg_reqs], device=eng.device)
         pos = torch.tensor(
@@ -365,13 +364,12 @@ class MTPManager:
         return _lap
 
     def begin_round(self, reqs: List[Req]) -> _RoundState:
-        """Draft/verify half of a round: allocate the verify window, run the draft chain,
-        snapshot the GDN state and LAUNCH the verify. On return the host ``device_len``/
+        """Draft/verify half of a round: allocate the verify window, run the draft chain and
+        LAUNCH the verify. On return the host ``device_len``/
         ``input_ids`` are restored to the round-entry geometry, so an interleaved drain of
         the previous batch appends its pending token at ``cached_len``; the verify's own
         effects live in GPU buffers (and ``finish_round`` re-points the host view forward)."""
         sched, eng = self.sched, self.engine
-        cm = sched.cache_manager
         pool = eng.linear_state_pool
         k, n = self.k, len(reqs)
         dev = eng.device
@@ -412,21 +410,24 @@ class MTPManager:
         ].to(torch.int32)
         R_last = torch.stack([r.mtp_streams_row for r in reqs], dim=0)
         drafts_gpu: List[torch.Tensor] = []
+        dv = getattr(eng, "draft_vocab", None)
+        subset = dv is not None and dv.active
         dgr = getattr(eng, "draft_graph_runner", None)
-        if dgr is not None and dgr.can_use(n, max(r.device_len for r in reqs)):
+        if dgr is not None and dgr.can_use(n):
             # Phase 3b: replay the captured draft step k times, staging the per-step
             # positions/out_loc/MTP-KV length in between (the graph bakes the kernels, not
-            # the geometry). The R_next/token hand-off stays eager (a copy and an argmax).
+            # the geometry). The R_next/token hand-off stays eager (copies).
             tables = [r.table_idx for r in reqs]
             for j in range(k):
                 pos = torch.tensor([c + j for c in C], dtype=torch.int32, device=dev)
                 out_loc = eng.page_table[
                     torch.tensor(tables, dtype=torch.int64, device=dev), pos.to(torch.int64)
                 ]
-                R_next, logits = dgr.replay_step(
-                    tables, [c + j + 1 for c in C], pos, out_loc.to(torch.int32), R_last, toks
+                R_next, d = dgr.replay_step(
+                    tables, [c + j + 1 for c in C], pos, out_loc.to(torch.int32), R_last, toks,
+                    subset=subset,
                 )
-                d = torch.argmax(logits, dim=-1).to(torch.int32)
+                d = d.clone()  # the graph's static id buffer is overwritten by the next step
                 drafts_gpu.append(d)
                 toks = d
                 R_last = R_next
@@ -440,8 +441,7 @@ class MTPManager:
                 )
                 with eng.ctx.forward_batch(sb):
                     R_next, hidden = self.mtp.draft_step(self.embed, R_last, toks, sb)
-                    logits = self.lm_head.forward(hidden)  # 1 token/req: last-row select = the row
-                d = torch.argmax(logits, dim=-1).to(torch.int32)
+                    d = dv.argmax(hidden) if subset else self.lm_head.forward_argmax(hidden)
                 drafts_gpu.append(d)
                 toks = d
                 R_last = R_next
@@ -467,24 +467,7 @@ class MTPManager:
                 sched.token_pool[r.table_idx, C[i] + 1 + j] = drafts_gpu[j][i]
         _lap("stage")
 
-        # -- 4. snapshot the GDN live state; the verify over-advances it in place
-        hybrid = pool is not None and cm.is_hybrid
-        scratch: List[int] = []
-        if pool is not None:
-            if hybrid:
-                cm.ensure_mamba_slots(n)
-                scratch = pool.alloc(n)
-            for i, r in enumerate(reqs):
-                live = (
-                    r.linear_slot_idx
-                    if (hybrid and r.linear_slot_idx is not None)
-                    else r.table_idx
-                )
-                if hybrid:
-                    pool.copy_from(live, scratch[i])
-        _lap("snapshot")
-
-        # -- 5. verify forward (k+1 tokens per request, full per-position logits). Gather
+        # -- 4. verify forward (k+1 tokens per request, full per-position logits). Gather
         #       NOW, after step 3 staged the drafts into token_pool: the verify must be
         #       conditioned on the pending token + the actual draft chain, not placeholders.
         verify_batch.input_ids = sched.token_pool[inp_map, inp_pos]
@@ -492,7 +475,7 @@ class MTPManager:
         # accepted-prefix commit (Phase 2).
         verify_batch.mtp_verify = True
         vgr = getattr(eng, "verify_graph_runner", None)
-        if vgr is not None and vgr.can_use(n, max(r.device_len for r in reqs)):
+        if vgr is not None and vgr.can_use(n):
             # Phase 3: replay the captured verify extend (fixed n_max x (k+1) shape).
             logits, verify_streams = vgr.replay(verify_batch)
         else:
@@ -507,7 +490,7 @@ class MTPManager:
 
         return _RoundState(
             reqs, C, k, n, dev, verify_batch, logits, verify_streams, drafts_gpu,
-            toks, hybrid, scratch, pool, _moe, self._timing_on,
+            toks, pool, _moe, self._timing_on,
         )
 
     def finish_round(
@@ -520,7 +503,7 @@ class MTPManager:
         sched, eng = self.sched, self.engine
         cm = sched.cache_manager
         reqs, C, k, n, dev = state.reqs, state.C, state.k, state.n, state.dev
-        pool, scratch, hybrid = state.pool, state.scratch, state.hybrid
+        pool = state.pool
         logits, verify_streams, drafts_gpu = state.logits, state.verify_streams, state.drafts_gpu
         _moe = state.moe
         deferred = deferred_finish or set()
@@ -650,29 +633,23 @@ class MTPManager:
             plans.append((r, rext_end, keep_to, finished, bonus_published))
         _lap("publish")
 
-        # -- 7. restore the pre-verify state, then commit the accepted prefix (Phase 2:
-        #       no re-extend). The chunk verify over-advanced the live state; restore it
-        #       from the snapshot, then commit_verify replays exactly the accepted tokens
-        #       into the live conv + SSM slots from the captured inputs.
-        if pool is not None and hybrid:
-            live_slots = []
-            for i, (r, _rext, _keep, _fin, _bp) in enumerate(plans):
-                live = (
-                    r.linear_slot_idx
-                    if (hybrid and r.linear_slot_idx is not None)
-                    else r.table_idx
-                )
-                pool.copy_from(scratch[i], live)
-                live_slots.append(live)
+        # -- 7. commit the accepted prefix (pending token + accepted drafts) into the live
+        #       conv + SSM slots; the verify left the recurrent state untouched.
+        if pool is not None:
+            live_slots = [
+                r.linear_slot_idx if r.linear_slot_idx is not None else r.table_idx
+                for (r, _rext, _keep, _fin, _bp) in plans
+            ]
             lens = [p[1] - C[i] for i, p in enumerate(plans)]
-            # n=1 uses the captured commit graph (kills the per-token launch tail); n>1 and
-            # any shape the graph lacks fall back to the eager per-token commit.
             cgr = getattr(eng, "commit_graph_runner", None)
-            if cgr is not None and cgr.can_use(n, lens[0]):
-                cgr.replay(live_slots[0], lens[0])
+            if cgr is not None and cgr.can_use(n):
+                cgr.replay(live_slots, lens)
             else:
-                eng.model.commit_mtp_verify(pool, lens, live_slots)
-            pool.free(scratch)
+                eng.model.commit_mtp_verify(
+                    pool,
+                    torch.tensor(live_slots, dtype=torch.int32, device=dev),
+                    torch.tensor(lens, dtype=torch.int32, device=dev),
+                )
         for i, (r, rext_end, keep_to, finished, bonus_published) in enumerate(plans):
             r.cached_len = rext_end
             if bonus_published and not finished:
@@ -707,6 +684,9 @@ class MTPManager:
             )
 
         # -- 8. publish
+        dv = getattr(eng, "draft_vocab", None)
+        if dv is not None:
+            dv.observe([m.next_token for m in reply])
         if reply:
             used, total = sched._kv_usage_pages()
             mamba_slots = sched._mamba_slot_usage()
@@ -768,3 +748,4 @@ class MTPManager:
                     f"MTP timing (avg over 100 rounds): {avg}{moe_stats} | tokens/round={tok}"
                 )
                 self._timing_acc.clear()
+                self._timing_n = 0

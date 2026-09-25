@@ -2,7 +2,8 @@
 
 The checkpoint ships one ``mtp.layers.N`` block plus head-level glue
 (``pre_fc_norm_{hidden,embedding}`` + ``fc``) and a final ``mtp.norm``. The head is
-always BF16 (the NVFP4/FP8 quantization stops at the main model's layers):
+always BF16 in the checkpoint (the NVFP4/FP8 quantization stops at the main model's
+layers); ``FREETOKEN_MTP_HEAD_FP8`` quantizes its linears to fp8 per row at load:
 
     e   = pre_fc_norm_embedding(embed_tokens(t))          # [T, H]
     R   = fc(cat([e, pre_fc_norm_hidden(R_last)], -1))    # [T, H]
@@ -21,7 +22,9 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Tuple
 
 import torch
+from freetoken.env import ENV
 from freetoken.layers import BaseOP, GemmaRMSNorm, LinearReplicated, OPList
+from freetoken.layers.quantization.linear.unquantized import mark_online_fp8
 
 from .attention import Qwen3_5Attention
 from .moe import Qwen3_5DenseMLP
@@ -71,6 +74,8 @@ class Qwen3_5MTP(BaseOP):
             ]
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if ENV.MTP_HEAD_FP8:
+            mark_online_fp8(self)
 
     def draft_step(
         self,

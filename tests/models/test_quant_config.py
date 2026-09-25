@@ -381,6 +381,39 @@ def test_unsupported_dialects_fail_closed(tmp_path):
         checkpoint_quant_config(str(tmp_path), hf_config, get_model_spec("Qwen3MoeForCausalLM"))
 
 
+def test_compressed_tensors_ignore_matches_exactly_not_subtree():
+    # llm-compressor lists container modules and their unquantized children in ``ignore``
+    # while the container's targeted Linear children ship quantized (Qwen3.8-27B-NVFP4 lists
+    # ``...linear_attn`` yet stores ``...linear_attn.in_proj_qkv.weight_scale``). A literal
+    # ignore entry matches only that exact module (compressed_tensors.utils.match.match_name),
+    # never its subtree — otherwise in_proj_qkv/in_proj_z/out_proj dequantize to bf16.
+    q = {
+        "quant_method": "compressed-tensors",
+        "ignore": [
+            "model.layers.0.linear_attn",
+            "model.layers.0.linear_attn.norm",
+            "model.layers.0.linear_attn.in_proj_a",
+            "model.layers.0.linear_attn.in_proj_b",
+        ],
+        "config_groups": {"g": {
+            "targets": [r"re:.*linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$"],
+            "weights": {"num_bits": 8, "type": "float", "strategy": "channel"},
+        }},
+    }
+    qc = CompressedTensorsConfig(q)
+    assert qc.scheme_for_name("model.layers.0.linear_attn.in_proj_qkv").kind is QuantKind.FP8_TENSOR
+    assert qc.scheme_for_name("model.layers.0.linear_attn.out_proj").kind is QuantKind.FP8_TENSOR
+    # the exact ignored modules (and the container itself) stay unquantized
+    assert qc.scheme_for_name("model.layers.0.linear_attn.in_proj_a") is None
+    assert qc.scheme_for_name("model.layers.0.linear_attn.in_proj_b") is None
+    assert qc.scheme_for_name("model.layers.0.linear_attn") is None
+    # ``re:`` ignore entries still match by regex, anchored at the start
+    q["ignore"] = [r"re:.*linear_attn\.in_proj_qkv$"]
+    qc = CompressedTensorsConfig(q)
+    assert qc.scheme_for_name("model.layers.0.linear_attn.in_proj_qkv") is None
+    assert qc.scheme_for_name("model.layers.0.linear_attn.in_proj_z").kind is QuantKind.FP8_TENSOR
+
+
 # --------------------------------------------------------------------------- config against the stored tensors
 
 # leaf names FreeToken builds as Linear / MoE layers; routers, norms, convs never ask for a scheme

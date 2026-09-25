@@ -76,13 +76,8 @@ class EnvClassSingleton:
     # reads saturate a 7 GB/s drive. See checkpoint/ftw.py:iter_ftw_weights.
     FTW_LOAD_WORKERS = EnvInt(16)
     FTW_LOAD_WINDOW_MB = EnvInt(2048)
-    # MTP verify/draft CUDA-graph KV cap. FlashInfer's graph-mode paged prefill plans once
-    # and must run with split-KV disabled (its split schedule is baked for the plan-time
-    # geometry); planning at very large kv lengths faults, so the graph is used only up to
-    # this many KV tokens per request and falls back to the eager extend above it.
-    MTP_GRAPH_MAX_KV = EnvInt(8192)
-    # Capture the GDN commit (Phase 2 per-token replay) as a CUDA graph for n=1;
-    # the commit's ~2 launches/GDN-layer per accepted token otherwise dominate the round.
+    # Capture the MTP GDN commit as a CUDA graph (one per verify batch size); eager, its
+    # ~3 small launches per GDN layer make the commit launch-bound.
     MTP_COMMIT_GRAPH = EnvBool(False)
     # PLE table load: outstanding O_DIRECT chunk reads per shard. The ~48 GiB table is
     # read shard-by-shard (concentrating workers on one file beats spreading them across
@@ -90,23 +85,35 @@ class EnvClassSingleton:
     PLE_LOAD_WORKERS = EnvInt(16)
     # MTP speculative decoding (eager, non-overlap).
     # Draft chain length k: each round drafts k tokens and verifies them in one
-    # k+1-token extend. Must satisfy k + 1 < the GDN chunk size (64) so verify
-    # extends never cross a ×64 track boundary.
+    # k+1-token extend. Must satisfy k + 1 <= the GDN chunk size (64) so verify
+    # extends never cross a x64 track boundary.
     MTP_DRAFT_TOKENS = EnvInt(3)
     # Sampled-request MTP (Phase 1 rejection sampling). OFF by default: it is correct but
     # currently a net slowdown until the speed phases land, so production (sampled by
     # default) is not gated on it.
     MTP_SAMPLED = EnvBool(False)
     # Chain MTP rounds back-to-back (no plain decode step in between): the next round
-    # consumes the just-published bonus as its pending token. Off by default: measured on
-    # Qwen3.8-Flash-Next the round's per-token cost is ~equal to a plain graph decode
-    # token, so chaining is throughput-neutral there (the win needs a cheaper verify).
-    MTP_CHAIN = EnvBool(False)
+    # consumes the just-published bonus as its pending token. A round is cheaper per token
+    # than a plain decode step (Qwen3.8-27B, 2x3090: 69 vs 63 tok/s at 1k context, 74 vs
+    # 59 at 14k), so the interleaved plain step only dilutes it. FREETOKEN_MTP_CHAIN=0 to
+    # interleave.
+    MTP_CHAIN = EnvBool(True)
     # n-gram draft combiner: before the verify, override a request's MTP draft chain with
     # the continuation after the last match of its final NGRAM_SIZE tokens in its own
     # history (repetitions need no model). OFF by default.
     MTP_NGRAM = EnvBool(False)
     MTP_NGRAM_SIZE = EnvInt(3)
+    # Draft vocabulary size: the draft chain's argmax runs over the lm_head rows of the V most
+    # frequently generated tokens (learned from the served traffic, see engine/draft_vocab.py)
+    # instead of the whole vocab. 0 = always the full vocab.
+    MTP_DRAFT_VOCAB = EnvInt(32768)
+    # Quantize the bf16 MTP draft head's linears to fp8 per row at load (W8A16): half the
+    # draft step's weight traffic; only the drafts change, the target verifies them.
+    MTP_HEAD_FP8 = EnvBool(True)
+    # Quantize every bf16 linear of the main model (routers excepted) to fp8 per row at load
+    # and run it W8A16: half the weight traffic of bandwidth-bound decode, at the cost of
+    # fp8 weight rounding. Off by default (it changes the model's numerics).
+    DENSE_FP8 = EnvBool(False)
     # MTP-verify CPU experts: compute the verify's routed experts on the CPU executor
     # (RAM-resident host banks) while normal decode stays on the GPU offload path.
     MOE_VERIFY_CPU = EnvBool(False)

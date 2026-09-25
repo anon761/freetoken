@@ -12,8 +12,8 @@ dummy page/slot so they never touch a real request's KV or GDN state.
   ``kvlen`` / ``ring_slots`` / ``block_table``) is staged via ``stage_verify_round``; the
   active row count is selected with ``set_verify_n``;
 * the GDN metadata (constant ``cu_seqlens``, per-round ``cache_indices``, all-continuing
-  ``has_initial_state``) points at static buffers; the GDN per-token input capture for the
-  Phase-2 commit is itself a captured copy, so ``commit_verify`` still works after replay.
+  ``has_initial_state``) points at static buffers; the GDN verify writes its commit inputs
+  into static per-layer buffers, so ``commit_verify`` works after replay.
 
 Everything inside the captured region is a device kernel; the eager Python (metadata
 build, page allocation, paged gather) stays outside. Off by default.
@@ -71,10 +71,7 @@ class VerifyGraphRunner:
         self.out_loc = torch.zeros(self.total, dtype=torch.int32, device=device)
         self.gdn_slots = torch.full((self.n_max,), padding_slot, dtype=torch.int32, device=device)
         self.has_init = torch.ones(self.n_max, dtype=torch.bool, device=device)
-        # int64: the FLA chunk path does cu_seqlens.to(torch.int64), which must stay the SAME
-        # object for @tensor_cache to hit during capture (an int32 input would re-create it
-        # per layer -> a host index prep with an unpinned H2D, forbidden under capture).
-        self.cu_seqlens = torch.arange(self.n_max + 1, dtype=torch.int64, device=device) * t
+        self.cu_seqlens = torch.arange(self.n_max + 1, dtype=torch.int32, device=device) * t
         self.logits = torch.empty(self.total, vocab_size, dtype=torch.float32, device=device)
         # Padding rows: dummy positions and the dummy page's slots (safe no-op writes).
         self.pad_positions = torch.arange(t, dtype=torch.int32, device=device).repeat(self.n_max)
@@ -82,20 +79,10 @@ class VerifyGraphRunner:
         self.pad_out_loc = dummy_row.repeat(self.n_max).contiguous()
 
         self.attn.init_capture_verify(self.n_max, t)
-        # KV cap the backend supports in graph mode (None = unbounded): above it the
-        # eager extend is used (FlashInfer's graph-mode prefill faults at large kv).
-        self.max_kv = getattr(attn_backend, "graph_extend_max_kv", None)
-        # Descending: the largest capture allocates the shared GDN verify-capture buffers,
-        # smaller graphs then reuse them (GDN _ensure_mtp_capture keeps the max).
+        # Descending: the largest capture allocates the per-layer GDN verify buffers, smaller
+        # graphs then reuse them (gdn_verify.ensure_verify_buffers keeps the max).
         for bs in sorted(self.bs_list, reverse=True):
             self._capture(bs)
-        # The FLA chunk kernels call @tensor_cache helpers whose result tensors are baked
-        # into these graphs. Pin the current entries so later eager prefill calls cannot
-        # evict them and free the tensors under the captured kernels (illegal access on
-        # replay). See kernel/fla/utils.py:tensor_cache.
-        from freetoken.kernel.fla.utils import pin_all_tensor_caches
-
-        pin_all_tensor_caches()
 
     # ------------------------------------------------------------------ capture
 
@@ -157,11 +144,8 @@ class VerifyGraphRunner:
 
     # ------------------------------------------------------------------ replay
 
-    def can_use(self, n: int, max_kv: int | None = None) -> bool:
-        return (
-            0 < n <= self.n_max
-            and (max_kv is None or self.max_kv is None or max_kv <= self.max_kv)
-        )
+    def can_use(self, n: int) -> bool:
+        return 0 < n <= self.n_max
 
     def _select_bs(self, n: int) -> int:
         return next(bs for bs in self.bs_list if bs >= n)

@@ -37,13 +37,22 @@ def substr_set(patterns: tuple[str, ...]) -> Matcher:
     return lambda name: rx is not None and rx.search(name + ".") is not None
 
 
-def ct_set(patterns: tuple[str, ...], *, class_names: bool) -> Matcher:
-    """compressed-tensors ``targets`` / ``ignore``: module names, ``re:`` regexes, or the class name Linear."""
-    names = name_set(tuple(p for p in patterns if not p.startswith("re:") and p != "Linear"))
+def ct_set(patterns: tuple[str, ...], *, class_names: bool, exact: bool = False) -> Matcher:
+    """compressed-tensors ``targets`` / ``ignore``: module names, ``re:`` regexes, or the class name Linear.
+
+    ``exact`` (``ignore``): a literal entry matches that module only, not its subtree -- as
+    ``compressed_tensors.utils.match.match_name`` does. llm-compressor lists container modules
+    (and their unquantized children) in ``ignore`` while the container's targeted Linear
+    children ship quantized (Qwen3.8-27B-NVFP4 ignores ``...linear_attn`` yet stores
+    ``...linear_attn.in_proj_qkv.weight_scale``), so a subtree match would dequantize them.
+    ``targets`` keep the subtree match: MoE checkpoints target the ``...mlp.experts`` container.
+    """
+    plain = tuple(p for p in patterns if not p.startswith("re:") and p != "Linear")
+    literal = frozenset(plain).__contains__ if exact else name_set(plain)
     regexes = [p[3:] for p in patterns if p.startswith("re:")]
     rx = re.compile("|".join(f"(?:{r})" for r in regexes)) if regexes else None
     any_linear = class_names and "Linear" in patterns
-    return lambda name: any_linear or names(name) or (rx is not None and rx.match(name) is not None)
+    return lambda name: any_linear or literal(name) or (rx is not None and rx.match(name) is not None)
 
 
 _ROUTED_EXPERT = re.compile(r"\.experts\.\d+(\.|$)")

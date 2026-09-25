@@ -25,7 +25,6 @@ import torch
 from freetoken.core import Batch, Req
 from freetoken.engine import DSPARK_VERIFY_MODES
 from freetoken.engine.sample import probs_from_logits, sample_residual
-from freetoken.env import ENV
 from freetoken.message import DetokenizeMsg
 from freetoken.utils import init_logger
 from .dspark_controller import Decision, DSparkController, DSparkFaultLatch, FaultKind
@@ -54,6 +53,8 @@ def _flat(t: torch.Tensor) -> torch.Tensor:
 
 class DSparkManager:
     uses_streams = False  # the draft reads the target aux buffer, not per-decode streams
+    # one synchronous round (no begin/finish split): the scheduler keeps it on normal_loop
+    overlaps = False
 
     def __init__(self, sched: "Scheduler") -> None:
         self.sched = sched
@@ -86,9 +87,6 @@ class DSparkManager:
         if not self.enabled:
             self.k = 0
             return
-        assert ENV.DISABLE_OVERLAP_SCHEDULING, (
-            "FREETOKEN_ENABLE_MTP=1 (DSpark) requires FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1"
-        )
         self.k = int(os.environ.get("FREETOKEN_DSPARK_K", self.draft.block_size))
         args = self.draft.args
         self.width = int(args.hidden_size) * len(args.dspark_target_layer_ids)

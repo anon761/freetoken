@@ -33,6 +33,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     retrieve_parent_token_ptr,
     stride_retrieve_parent_token_seq: tl.constexpr,
     stride_retrieve_parent_token_token: tl.constexpr,
+    num_steps_ptr,
     # ================================================
     scale,
     T,
@@ -57,6 +58,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    HAS_NUM_STEPS: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -75,6 +77,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     else:
         bos, eos = i_n * T, i_n * T + T
         all = B * T
+        if HAS_NUM_STEPS:
+            # sequence i_n advances only its first num_steps[i_n] tokens (the rows stay T apart)
+            T = tl.load(num_steps_ptr + i_n).to(tl.int32)
 
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
@@ -268,6 +273,7 @@ def fused_sigmoid_gating_delta_rule_update(
         int
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    num_steps: Optional[torch.Tensor] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -278,7 +284,11 @@ def fused_sigmoid_gating_delta_rule_update(
     - decode: standard single-step update with state write-back
     - target_verify: multi-step with intermediate state caching, optional tree attention,
                      and optional state update disable
+
+    ``num_steps`` ([B] int32, non-varlen only): sequence ``i`` runs its first ``num_steps[i]``
+    of the ``T`` tokens and writes the state reached there (MTP accepted-prefix commit).
     """
+    assert num_steps is None or cu_seqlens is None, "num_steps needs the fixed-T layout"
     B, T, H, K, V = *k.shape, v.shape[-1]
     stride_q = q.stride()[1]
     stride_k = k.stride()[1]
@@ -343,6 +353,7 @@ def fused_sigmoid_gating_delta_rule_update(
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
+        num_steps_ptr=num_steps,
         scale=scale,
         T=T,
         stride_a=stride_a,
@@ -365,6 +376,7 @@ def fused_sigmoid_gating_delta_rule_update(
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        HAS_NUM_STEPS=num_steps is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )

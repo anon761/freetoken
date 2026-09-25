@@ -31,8 +31,8 @@ class _SharedExpert(BaseOP):
             quant_config=config.quant, prefix=f"{prefix}.down_proj",
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
+    def forward(self, x: torch.Tensor, reduce: bool = True) -> torch.Tensor:
+        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)), reduce=reduce)
 
 
 class Qwen3_5DenseMLP(_SharedExpert):
@@ -75,11 +75,15 @@ class Qwen3_5MoE(BaseOP):
         # Compute the router + shared expert BEFORE the routed experts: the fused MoE
         # kernel may write into ``hidden_states`` in place, which would corrupt the
         # shared expert's input (HF also evaluates the shared expert first).
+        # Shared and routed partials are summed BEFORE the TP all_reduce: the gate is
+        # replicated, so reduce(routed) + g * reduce(shared) == reduce(routed + g * shared).
         router_logits = self.gate.forward(hidden_states)
-        shared = self.shared_expert.forward(hidden_states)
+        shared = self.shared_expert.forward(hidden_states, reduce=False)
         shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
-        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
-        return (routed + shared).view(num_tokens, hidden_dim)
+        routed = self.experts.forward(
+            hidden_states=hidden_states, router_logits=router_logits, reduce=False
+        )
+        return self.experts._maybe_all_reduce(routed + shared).view(num_tokens, hidden_dim)
 
 
 __all__ = ["Qwen3_5MoE", "Qwen3_5DenseMLP"]

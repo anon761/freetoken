@@ -718,6 +718,21 @@ _CT_BF16_FUSE: dict[str, tuple[str, ...]] = {
         ".linear_attn.in_proj_b", ".linear_attn.in_proj_a",
     ),
 }
+# When the model splits GDN (qkv|z fp8 -> ``in_proj_qkvz``, b|a bf16 -> ``in_proj_ba``),
+# the bf16 parts must fuse into the same split buffers the model builds -- mirroring the
+# modelopt path's ``_PT_BF16_FUSE``. Used only when the model has a scheme for
+# ``in_proj_qkvz``; a fully bf16 GDN keeps the joint ``in_proj`` fusion above.
+_CT_BF16_SPLIT_FUSE: dict[str, tuple[str, ...]] = {
+    ".linear_attn.in_proj_qkvz": (".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z"),
+    ".linear_attn.in_proj_ba": (".linear_attn.in_proj_b", ".linear_attn.in_proj_a"),
+}
+_GDN_IN_PROJ_PARTS = (
+    ".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z",
+    ".linear_attn.in_proj_b", ".linear_attn.in_proj_a",
+)
+_GDN_BF16_FUSE_PARTS = frozenset(
+    p for groups in (_CT_BF16_FUSE, _CT_BF16_SPLIT_FUSE) for parts in groups.values() for p in parts
+)
 # The MTP head's bf16 block: q/k/v -> qkv_proj, gate/up -> gate_up_proj (the same fused
 # buffers the main stack uses). Kept separate from _CT_BF16_FUSE so an NVFP4 checkpoint's
 # main q/k/v stay native (the MTP parts are always bf16 ``.weight``).
@@ -767,6 +782,16 @@ def _model_scheme(quant, prefix: str):
         return None
 
 
+def _gdn_split(quant, base: str) -> bool:
+    """Whether the model builds the split GDN buffers (``in_proj_qkvz`` + ``in_proj_ba``)
+    for the projection ``base`` -- true iff it has a quantization scheme for the fused
+    ``in_proj_qkvz`` (the same probe ``GDNLayer._split_in_proj`` uses)."""
+    for part in _GDN_IN_PROJ_PARTS:
+        if base.endswith(part):
+            return _model_scheme(quant, base[: -len(part)] + ".linear_attn.in_proj_qkvz") is not None
+    return False
+
+
 def _iter_weights_compressed_tensors(
     model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool,
     nvfp4: bool,
@@ -799,7 +824,12 @@ def _iter_weights_compressed_tensors(
     def _emit_bf16_weight(name: str, tensor: torch.Tensor):
         """Plain bf16 ``.weight``: fusion, Gemma (1+w) norms, else passthrough."""
         base = name[: -len(".weight")]
-        groups = _MTP_BF16_FUSE if base.startswith("mtp.") else _CT_BF16_FUSE
+        if base.startswith("mtp."):
+            groups = _MTP_BF16_FUSE
+        elif _gdn_split(quant, base):
+            groups = _CT_BF16_SPLIT_FUSE
+        else:
+            groups = _CT_BF16_FUSE
         emit = _ct_bf16_fuse(base, tensor, bf16_buf, groups)
         if emit is not None:
             for key, part in emit:
@@ -835,8 +865,9 @@ def _iter_weights_compressed_tensors(
                     w, s, g = _nvfp4_parts_ct(reader, raw_base)
                     # GDN in_proj_* compute in bf16 (model contract) but some checkpoints
                     # (e.g. sakamakismile/Qwen3.6-27B-NVFP4) quantize them too: dequant to
-                    # bf16 here and let the bf16 fusion assemble ``in_proj`` as usual.
-                    if any(base.endswith(p) for ps in _CT_BF16_FUSE.values() for p in ps):
+                    # bf16 here and let the bf16 fusion assemble the model's GDN buffers
+                    # (joint ``in_proj``, or the split ``in_proj_qkvz``/``in_proj_ba``).
+                    if any(base.endswith(p) for p in _GDN_BF16_FUSE_PARTS):
                         bf16 = _dequant_nvfp4_weight(w, s, g[:1])
                         yield from _emit_bf16_weight(base + ".weight", bf16)
                         continue

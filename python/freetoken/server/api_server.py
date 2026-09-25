@@ -932,6 +932,11 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
 
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)
+    if config.force_greedy:
+        # Hard override (not a default): resolve_sampling collapses every request to
+        # greedy, ignoring client temperature/top_k/top_p.
+        _MODEL_SAMPLING = {**_MODEL_SAMPLING, "force_greedy": True}
+        logger.info("force_greedy enabled: all requests served greedily (temperature=0)")
     # Always surface the effective default sampling (model-recommended where available,
     # else framework defaults), since unspecified request fields resolve to these.
     logger.info(

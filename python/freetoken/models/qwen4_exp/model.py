@@ -245,37 +245,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         batch = get_global_ctx().batch
         return self.lm_head.forward_all(self.model.forward(batch.input_ids, batch))
 
-    def commit_mtp_verify(self, pool, lens, slots) -> None:
-        """Commit the accepted MTP-verify prefix into every GDN layer's live state from
-        the inputs captured during the verify forward -- replaces the full-model
-        re-extend (Phase 2). ``lens[i]`` = accepted tokens for request ``i``,
-        ``slots[i]`` = its live GDN pool slot."""
-        from freetoken.models.qwen3_5_moe.gdn_kernels import build_commit_prep
-
-        mixers = [
-            (layer, mixer)
-            for layer in self.model.layers.op_list
-            if (mixer := getattr(layer, "linear_attn", None)) is not None
-        ]
-        # The per-step subsets / cumulative lengths / slots are layer-invariant: build
-        # them ONCE so the 48 layers share the device tensors (the commit is host-bound).
-        prep = None
-        for _layer, mixer in mixers:
-            cap = getattr(mixer, "_mtp_capture", None)
-            if cap is not None:
-                prep = build_commit_prep(lens, slots, cap["conv_in"].device)
-                break
-        if prep is None:
-            return
-        self.commit_mtp_verify_prep(pool, prep, lens)
-
-    def commit_mtp_verify_prep(self, pool, prep, lens) -> None:
-        """Captureable commit: run every GDN layer's ``commit_verify`` off a PREBUILT prep
-        (whose live-slot tensor is staged per round), so a CUDA graph can replay it."""
+    def commit_mtp_verify(self, pool, slots, lens) -> None:
+        """Commit the accepted MTP-verify prefix into every GDN layer's live state.
+        ``slots`` [n] int32 live GDN slots, ``lens`` [n] int32 accepted tokens per request
+        (both on device, so a CUDA graph can replay the commit with staged values)."""
         for layer in self.model.layers.op_list:
             mixer = getattr(layer, "linear_attn", None)
             if mixer is not None:
-                mixer.commit_verify(pool, lens, None, prep)
+                mixer.commit_verify(pool, slots, lens)
 
 
 __all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]

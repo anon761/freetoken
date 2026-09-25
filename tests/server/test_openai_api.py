@@ -417,6 +417,18 @@ def test_omitted_max_tokens_defaults_to_hardcoded_32k():
     assert exp_state.sent.sampling_params.max_tokens == 50
 
 
+def test_force_greedy_overrides_client_sampling():
+    # force_greedy is a hard override: a sampled request (temperature 1.0) becomes
+    # greedy, so the MTP draft path can run. Without the flag the client's sampling
+    # is honoured.
+    req = chat_request(temperature=1.0, top_p=0.95)
+    assert not chat_request_to_genspec(req, {}).sampling_params.is_greedy
+    forced = chat_request_to_genspec(req, {"force_greedy": True}).sampling_params
+    assert forced.is_greedy
+    assert forced.temperature == 0.0
+    assert forced.top_k == 1
+
+
 def test_models_route_returns_served_model_name():
     state = FakeState([])
     app = FastAPI()

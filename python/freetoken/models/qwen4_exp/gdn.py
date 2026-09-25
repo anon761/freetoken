@@ -6,11 +6,8 @@ from freetoken.core import get_global_ctx
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated, LinearRowParallel
 from freetoken.layers.quantization import QuantConfig
-from freetoken.models.qwen3_5_moe.gdn_kernels import (
-    build_commit_prep,
-    gdn_decode_fla,
-    gdn_prefill_chunk_fla,
-)
+from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
+from freetoken.models.qwen3_5_moe.gdn_verify import gdn_verify_commit, gdn_verify_forward
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -112,91 +109,17 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                 self.value_dim, hidden_size, has_bias=False,
                 quant_config=quant_config, prefix=f"{prefix}.out_proj",
             )
-        # MTP-verify capture: the raw per-token kernel inputs of the last verify forward,
-        # so the accepted prefix can be committed into the live state without a re-extend
-        # (see _capture_verify / commit_verify). Lazy, per-op, small.
-        self._mtp_capture: dict | None = None
+        # MTP verify buffers (conv window, post-conv activations, gates) of the last verify
+        # forward, read by commit_verify; allocated on the first verify (see gdn_verify).
+        self._mtp_verify = None
 
     # ------------------------------------------------------------- MTP verify path
 
-    def _ensure_mtp_capture(self, n: int, t: int, dtype, device) -> dict:
-        cap = self._mtp_capture
-        if cap is not None and cap["n"] >= n and cap["T"] >= t:
-            return cap
-        n, t = max(n, 1), max(t, 1)
-
-        def empty2d(width, dt):
-            return torch.empty(n, t, width, dtype=dt, device=device)
-
-        self._mtp_capture = {
-            "n": n,
-            "T": t,
-            "conv_in": empty2d(self.local_conv_dim, dtype),
-            "q": torch.empty(n, t, self.local_k_heads, self.head_k_dim, dtype=dtype, device=device),
-            "k": torch.empty(n, t, self.local_k_heads, self.head_k_dim, dtype=dtype, device=device),
-            "v": torch.empty(n, t, self.local_v_heads, self.head_v_dim, dtype=dtype, device=device),
-            "a": empty2d(self.local_v_heads, dtype),
-            "b": empty2d(self.local_v_heads, dtype),
-        }
-        return self._mtp_capture
-
-    def _capture_verify(self, conv_in, q, k, v, a, b, batch, dtype) -> None:
-        """Stash the verify forward's per-token GDN inputs for ``commit_verify``. The
-        verify batches are uniform (k+1 tokens per request), so the packed tensors view
-        directly as [n, T, ...]."""
-        reqs = batch.padded_reqs
-        # A captured verify batch carries its fixed (n, t); the eager path derives them.
-        n = getattr(batch, "mtp_verify_n", None) or len(reqs)
-        t = getattr(batch, "mtp_verify_t", None) or reqs[0].extend_len
-        cap = self._ensure_mtp_capture(n, t, dtype, q.device)
-        cap["conv_in"][:n, :t].copy_(conv_in.reshape(n, t, -1))
-        cap["q"][:n, :t].copy_(q.reshape(n, t, self.local_k_heads, self.head_k_dim))
-        cap["k"][:n, :t].copy_(k.reshape(n, t, self.local_k_heads, self.head_k_dim))
-        cap["v"][:n, :t].copy_(v.reshape(n, t, self.local_v_heads, self.head_v_dim))
-        cap["a"][:n, :t].copy_(a.reshape(n, t, self.local_v_heads))
-        cap["b"][:n, :t].copy_(b.reshape(n, t, self.local_v_heads))
-
     @torch.inference_mode()
-    def commit_verify(self, pool, lens, slots, prep=None) -> None:
+    def commit_verify(self, pool, slots: torch.Tensor, lens: torch.Tensor) -> None:
         """Advance this layer's live conv + recurrent state over each request's accepted
-        prefix (``lens[i]`` tokens from the captured verify inputs). The SSM is advanced
-        one token at a time with the fused DECODE kernel -- the exact recurrence a normal
-        step-at-a-time decode would run (the vendored target_verify/multi-token path
-        disagrees with the chunk kernel, so it is not used). The caller has restored the
-        live state to the pre-verify boundary. No full-model re-extend.
-
-        ``prep`` carries the layer-invariant device tensors (cumulative lengths, slots, and
-        the per-step active subsets); ``commit_mtp_verify`` builds it ONCE per round so the
-        48 layers do not each pay the host->device copies."""
-        cap = self._mtp_capture
-        if cap is None:
-            return
-        device = cap["conv_in"].device
-        if prep is None:
-            prep = build_commit_prep(lens, slots, device)
-        cu_t, idx_all, has_init, steps = prep
-        cu = [0]
-        cis = []
-        for i, n_i in enumerate(lens):
-            cis.append(cap["conv_in"][i, :n_i])
-            cu.append(cu[-1] + n_i)
-        # conv: replay the accepted prefix into the live conv slot (channels-first input).
-        self._conv_prefill(torch.cat(cis, 0), pool, cu_t, idx_all, has_init)
-        # SSM: per-token fused decode update, batched over the requests still at step j.
-        li = pool.local_index(self.layer_id)
-        state = pool.recurrent_states[li]
-        for j, (sub, idx_sub, cu_sub) in enumerate(steps):
-            q = cap["q"][sub, j].unsqueeze(0)  # [1, Bsub, H, K]
-            k = cap["k"][sub, j].unsqueeze(0)
-            v = cap["v"][sub, j].unsqueeze(0)
-            a = cap["a"][sub, j]
-            b = cap["b"][sub, j]
-            gdn_decode_fla(
-                q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
-                state_source=state, indices=idx_sub,
-                cu_seqlens=cu_sub,
-                scale=self.head_k_dim ** -0.5,
-            )
+        verify prefix (``lens``, device int32) -- see ``gdn_verify``."""
+        gdn_verify_commit(self, pool, slots, lens)
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
         beta = b.sigmoid()
@@ -280,6 +203,14 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
             )
+        elif getattr(batch, "mtp_verify", False):
+            # MTP verify: decode-exact conv + recurrence over the k+1 tokens, live SSM state
+            # untouched; commit_verify applies the accepted prefix afterwards.
+            n = getattr(batch, "mtp_verify_n", None) or len(batch.padded_reqs)
+            t = getattr(batch, "mtp_verify_t", None) or batch.padded_reqs[0].extend_len
+            core_out = gdn_verify_forward(
+                self, conv_in, a, b, pool, fla.cache_indices[:n], n, t, dtype
+            )
         else:
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
@@ -291,10 +222,6 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             g, beta = self._gate_params(a, b)
             g = g.reshape(1, total, self.local_v_heads)
             beta = beta.float().reshape(1, total, self.local_v_heads)
-            if getattr(batch, "mtp_verify", False):
-                # MTP verify: stash these exact kernel inputs so the accepted prefix can be
-                # replayed into the live state without a full-model re-extend (commit_verify).
-                self._capture_verify(conv_in, q[0], k[0], v[0], a, b, batch, dtype)
             # The chunk kernel reads + writes back initial_state[cache_indices] in place;
             # fresh sequences (cached_len==0) must start from a zeroed slot.
             if fla.fresh_state_indices is not None:

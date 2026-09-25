@@ -73,3 +73,32 @@ def causal_conv1d_decode(
         conv_state_indices.to(torch.int32), _PAD_SLOT_ID,
     )
     return x.squeeze(-1)
+
+
+def causal_conv1d_update_multi(
+    x: torch.Tensor,                # [batch, conv_dim, t] (any strides); overwritten with silu(conv)
+    conv_state: torch.Tensor,       # [num_slots, conv_dim, kernel-1] (in place, advanced by t)
+    weight: torch.Tensor,           # [conv_dim, kernel]
+    conv_state_indices: torch.Tensor,  # [batch] int32 slot id per request
+) -> None:
+    """``t`` consecutive decode conv updates per request in one call (MTP verify): the same
+    arithmetic as ``t`` single-token ``causal_conv1d_decode`` steps."""
+    from freetoken.kernel.backend import is_sgl_kernel_installed
+
+    if not is_sgl_kernel_installed():
+        from freetoken.kernel.triton.causal_conv1d_triton import (
+            causal_conv1d_decode as triton_causal_conv1d_decode,
+        )
+
+        for j in range(x.shape[-1]):
+            x[:, :, j] = triton_causal_conv1d_decode(
+                x[:, :, j].contiguous(), conv_state, weight, conv_state_indices
+            )
+        return
+
+    from sgl_kernel import causal_conv1d_update
+
+    causal_conv1d_update(
+        x, conv_state, weight, None, True, None,
+        conv_state_indices.to(torch.int32), _PAD_SLOT_ID,
+    )

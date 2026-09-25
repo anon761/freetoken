@@ -341,7 +341,16 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        from freetoken.env import ENV
+
+        if ENV.DENSE_FP8:
+            from freetoken.layers.quantization.linear.unquantized import mark_online_fp8
+
+            # routers stay bf16: they pick the experts, and they are tiny
+            n = mark_online_fp8(self.model, skip=frozenset({"gate", "shared_expert_gate"}))
+            logger.info_rank0(f"--dense-fp8: {n} bf16 linears quantized to fp8 per row at load")
         finalize_quant(self.model)
+        torch.cuda.empty_cache()  # hand the freed bf16 weights back before the budget below
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Ledger diagnostics: `weights_bytes` above is measured (free-VRAM delta), the
@@ -497,6 +506,19 @@ class Engine:
             logger.info_rank0(
                 f"MTP verify CUDA graphs captured: bs={_bs_list}, t={_t}"
             )
+        # MTP draft vocabulary: the draft chain's argmax over the most frequently generated
+        # tokens instead of the whole lm_head (see engine/draft_vocab.py).
+        self.draft_vocab = None
+        if getattr(self.model, "mtp", None) is not None:
+            from freetoken.engine.draft_vocab import DraftVocabHead
+            from freetoken.env import ENV
+
+            _dv = int(ENV.MTP_DRAFT_VOCAB.value)
+            if _dv > 0 and DraftVocabHead.supported(self.model.lm_head):
+                self.draft_vocab = DraftVocabHead(self.model.lm_head, _dv, self.device)
+                logger.info_rank0(f"MTP draft vocab: learning the top {_dv} generated tokens")
+            elif _dv > 0:
+                logger.info_rank0("MTP draft vocab: lm_head format unsupported, full vocab")
         # MTP draft-chain CUDA graph (Phase 3b), opt-in: the MTP block's single-token draft
         # step captured per padded batch size and replayed k times per round. The MTP block's
         # routed experts are resident bf16, so the captured region is device-only.
@@ -519,28 +541,29 @@ class Engine:
                 attn_backend=self.attn_backend,
                 bs_list=_dbs_list,
                 width=_width,
-                vocab_size=config.model_config.vocab_size,
                 device=self.device,
+                draft_vocab=self.draft_vocab,
             )
-        # MTP GDN-commit CUDA graph (n=1): replays the accepted-prefix commit from the
-        # static verify-capture buffers, removing the per-token launch tail. Needs the verify
-        # graph (its capture allocates the per-layer _mtp_capture buffers).
+        # MTP GDN-commit CUDA graph: one graph per verify batch size replays the accepted-
+        # prefix commit (slots/lengths staged on device). Needs the verify graph (its capture
+        # allocates the per-layer verify buffers the commit reads).
         self.commit_graph_runner = None
         if (
             os.environ.get("FREETOKEN_MTP_COMMIT_GRAPH") == "1"
-            and getattr(self.model, "commit_mtp_verify_prep", None) is not None
+            and getattr(self.model, "commit_mtp_verify", None) is not None
             and self.linear_state_pool is not None
             and self.verify_graph_runner is not None
         ):
             from freetoken.engine.commit_graph import CommitGraphRunner
-            from freetoken.env import ENV
 
-            _k = int(ENV.MTP_DRAFT_TOKENS.value)
             self.commit_graph_runner = CommitGraphRunner(
-                model=self.model, pool=self.linear_state_pool, k=_k,
+                model=self.model, pool=self.linear_state_pool,
+                bs_list=self.verify_graph_runner.bs_list, t=self.verify_graph_runner.t,
                 device=self.device, stream=self.graph_runner.stream,
             )
-            logger.info_rank0(f"MTP commit CUDA graphs captured: k={_k}")
+            logger.info_rank0(
+                f"MTP commit CUDA graphs captured: bs={self.verify_graph_runner.bs_list}"
+            )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()

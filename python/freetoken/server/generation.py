@@ -171,6 +171,11 @@ def resolve_sampling(
         return value if value is not None else model_sampling.get(key, framework)
 
     stop_list = [stop] if isinstance(stop, str) else list(stop or [])
+    # --force-greedy: ignore client sampling entirely and collapse to greedy (the only
+    # path MTP speculative decoding runs on). Overrides explicit client values, unlike the
+    # model_sampling defaults below, which only fill unspecified fields.
+    if model_sampling.get("force_greedy"):
+        temperature, top_k, top_p = 0.0, 1, 1.0
     # `is not None`, not truthiness: an explicit max_tokens=0 must not read as "unset" and
     # silently become the 32k default. The engine cannot serve a zero-token budget either
     # (the request would never become decodable, so the client would wait forever), so a

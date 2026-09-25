@@ -139,6 +139,24 @@ class ParallelLMHead(VocabParallelEmbedding):
         last-row selection) -- the MTP verify path scores all draft positions."""
         return self._gather_vocab(self._logits(x))
 
+    def forward_argmax(self, x: torch.Tensor) -> torch.Tensor:
+        """Greedy token per row ([T] int32), the MTP draft chain's only use of the head.
+        Each rank reduces its own vocab shard; only a (max, id) pair per row crosses ranks
+        instead of the full [T, vocab] logits. Same result as ``argmax(forward_all(x))``:
+        the lower rank holds the lower ids, so it wins ties like torch.argmax does."""
+        logits = self._logits(x)[:, : self.vocab_range[1]]
+        if self.tp_size == 1:
+            return torch.argmax(logits, dim=-1).to(torch.int32)
+        val, idx = logits.float().max(dim=-1)
+        ids = (idx + self.vocab_range[0]).to(torch.int32)
+        pairs = torch.stack([val, ids.view(torch.float32)], dim=-1)  # [T, 2]
+        # as raw bytes: the pynccl transport has no fp32 all_gather, uint8 is byte-transparent
+        gathered = self._comm.all_gather(pairs.view(torch.uint8)).view(torch.float32)
+        gathered = gathered.view(self.tp_size, -1, 2)
+        best = gathered[..., 0].argmax(dim=0)  # [T]
+        rows = torch.arange(best.shape[0], device=best.device)
+        return gathered[best, rows, 1].contiguous().view(torch.int32)
+
     def _logits(self, x: torch.Tensor) -> torch.Tensor:
         if self.tied_embedding is not None:
             return F.linear(x, self.tied_embedding.weight, self.bias)

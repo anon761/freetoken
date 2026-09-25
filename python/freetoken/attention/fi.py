@@ -145,7 +145,6 @@ class FlashInferBackend(BaseAttnBackend):
         # MTP verify/draft extend graphs (graph-mode paged prefill; see _init_capture_extend).
         self._verify_graph: dict = {}
         self._draft_graph: dict = {}
-        self.graph_extend_max_kv: int | None = None
         self.last_event = torch.cuda.Event()
         self.last_event.record()
 
@@ -272,7 +271,6 @@ class FlashInferBackend(BaseAttnBackend):
         self.graph_wrappers = {}
         self._verify_graph = {}
         self._draft_graph = {}
-        self.graph_extend_max_kv = None
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
@@ -317,20 +315,18 @@ class FlashInferBackend(BaseAttnBackend):
     #
     # The MTP verify is a prefill extend of t=k+1 tokens/request, the draft chain the MTP
     # block's per-step extend of t=1. FlashInfer's paged-prefill wrapper has a CUDA-graph
-    # mode (``use_cuda_graph=True`` + caller-owned indptr/indices buffers): plan ONCE, then
-    # per round overwrite only the device buffers and replay. Two constraints, both found on
-    # hardware: split-KV must be DISABLED (its split schedule is baked for the plan-time
-    # geometry and is wrong once the staged lengths differ), and the plan faults at very
-    # large kv lengths -- so the graph covers kv <= MTP_GRAPH_MAX_KV and the caller falls
-    # back to the eager extend above it (``graph_extend_max_kv``). Mirrors
-    # QSASparseAttnBackend's init_capture_verify/draft + stage/scratch contract.
+    # mode (``use_cuda_graph=True`` + caller-owned indptr/indices buffers): the grid size is
+    # fixed at capture and split-KV is always on, while the per-round split schedule
+    # (tile indices, kv chunk size, merge indptr) lives in the int workspace. So every round
+    # RE-PLANS with the real kv lengths before the replay (``_stage_extend_round``), exactly
+    # like the decode graph's ``prepare_for_replay``; the kv indices buffer spans the full
+    # ``max_seq_len`` per request. Mirrors QSASparseAttnBackend's
+    # init_capture_verify/draft + stage/scratch contract.
 
     def _init_capture_extend(self, n_max: int, t: int) -> dict:
         if self.capture is None:
             raise RuntimeError("init_capture_graph must run before an MTP extend capture")
-        width = int(self.capture.page_table.numel() // max(1, self.max_graph_bs))
-        width = max(t, min(width, int(ENV.MTP_GRAPH_MAX_KV.value)))
-        self.graph_extend_max_kv = width
+        width = max(t, int(self.capture.page_table.numel() // max(1, self.max_graph_bs)))
         return {
             "n": n_max,
             "t": t,
@@ -348,7 +344,6 @@ class FlashInferBackend(BaseAttnBackend):
             return w
         from flashinfer import BatchPrefillWithPagedKVCacheWrapper
 
-        t, width = store["t"], store["width"]
         w = BatchPrefillWithPagedKVCacheWrapper(
             self.float_workspace_buffer,
             kv_layout="NHD",
@@ -359,12 +354,22 @@ class FlashInferBackend(BaseAttnBackend):
             paged_kv_last_page_len_buf=store["lpl"][:bs],
             backend="fa2",
         )
+        store["wrappers"][bs] = w
+        self._plan_extend(store, bs, [store["t"]] * bs)
+        return w
+
+    def _plan_extend(self, store: dict, bs: int, kv: list[int]) -> None:
+        """(Re-)plan the graph-mode extend wrapper of size ``bs`` for per-row kv lengths
+        ``kv`` (indices already staged in ``store["idx"]``); runs outside the graph."""
+        t = store["t"]
+        cpu = {"dtype": torch.int32, "pin_memory": torch.cuda.is_available()}
+        kv_indptr = torch.tensor([0] + kv, **cpu).cumsum_(0).to(torch.int32)
         self.last_event.synchronize()  # plan reuses a pinned staging buffer (see decode plan)
-        w.plan(
-            torch.arange(bs + 1, dtype=torch.int32) * t,
-            torch.arange(bs + 1, dtype=torch.int32) * width,
-            torch.arange(bs * width, dtype=torch.int32),
-            torch.ones(bs, dtype=torch.int32),
+        store["wrappers"][bs].plan(
+            torch.arange(bs + 1, **cpu) * t,
+            kv_indptr,
+            store["idx"][: int(kv_indptr[-1])],
+            torch.ones(bs, **cpu),
             self.qo_head_local,
             self.kv_head_local,
             self.config.head_dim,
@@ -373,13 +378,12 @@ class FlashInferBackend(BaseAttnBackend):
             pos_encoding_mode="NONE",
             q_data_type=self.kvcache.dtype,
             kv_data_type=self.kvcache.dtype,
-            disable_split_kv=True,
+            non_blocking=True,
         )
-        store["wrappers"][bs] = w
-        return w
+        self.last_event.record()
 
     def _extend_metadata(self, store: dict) -> FIMetadata:
-        bs, t = store["n"], store["t"]
+        bs = store["n"]
         cpu = {"device": "cpu", "dtype": torch.int32, "pin_memory": torch.cuda.is_available()}
         return FIMetadata(
             cu_seqlens_q_cpu=torch.empty(bs + 1, **cpu),
@@ -400,23 +404,20 @@ class FlashInferBackend(BaseAttnBackend):
 
     def _stage_extend_round(self, store: dict, table_idx, kvlen, pad_table_idx: int) -> None:
         """Fill the active rows (first n real, tail padded at ``pad_table_idx``/kv=t) so the
-        captured kernels never touch a real request's KV. Runs OUTSIDE the graph, so plain
-        device copies of indptr/indices are fine. ``kvlen`` is capped by
-        ``graph_extend_max_kv`` (the caller checked)."""
+        captured kernels never touch a real request's KV, then re-plan the split schedule
+        for these lengths. Runs OUTSIDE the graph."""
         bs, t = store["n"], store["t"]
         n = len(table_idx)
         rows = [int(x) for x in table_idx] + [int(pad_table_idx)] * (bs - n)
         kv = [int(x) for x in kvlen] + [t] * (bs - n)
-        ip = [0]
-        for k in kv:
-            ip.append(ip[-1] + k)
-        store["ip"][: bs + 1].copy_(torch.tensor(ip, dtype=torch.int32, device=self.device))
-        store["lpl"][:bs].fill_(1)
+        assert max(kv) <= store["width"], f"kv {max(kv)} exceeds the graph width {store['width']}"
         pt = get_global_ctx().page_table
         off = 0
         for row, k in zip(rows, kv):
             store["idx"][off : off + k].copy_(pt[row, :k])
             off += k
+        self._extend_wrapper(store, bs)
+        self._plan_extend(store, bs, kv)
 
     def init_capture_verify(self, n_max: int, t: int) -> None:
         self._verify_graph = self._init_capture_extend(n_max, t)

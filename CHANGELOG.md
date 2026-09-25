@@ -40,6 +40,7 @@ Everything below landed after `v0.1.2` (2026-08-19). It currently lives on the
 - Sampled-request MTP gated behind `FREETOKEN_MTP_SAMPLED` (default off) (`8b914e0`)
 - Opt-in round chaining (`FREETOKEN_MTP_CHAIN`) (`a64e66d`)
 - Self-history n-gram draft combiner (`FREETOKEN_MTP_NGRAM`) (`d28592f`)
+- Frequency-adapted draft vocabulary (`--mtp-draft-vocab`) and fp8 draft head at load (`--mtp-head-fp8`) (`20d8a02`)
 
 **FTW checkpoints**
 - TP-slicing for FTW checkpoints (dense replay + expert banks) (`213389c`)
@@ -78,6 +79,8 @@ Everything below landed after `v0.1.2` (2026-08-19). It currently lives on the
 - Shared block-fp8 expert reader; dropped the cross-family hook (`8955e1e`)
 - Default `expert_load_workers` raised 8 → 16 (saturates the NVMe) (`7e71fd8`)
 - Small MoE chunks fetch routed experts instead of whole layers (`aa1930f`)
+- MTP round chaining is on by default (`--no-mtp-chain` to interleave plain decode steps) (`20d8a02`)
+- compressed-tensors `ignore` matches module names exactly; existing FTWs of checkpoints that ignore a container with quantized children (Qwen3.8-27B-NVFP4) must be re-converted (`50b629f`)
 
 ### Fixed
 - **FTW: TP band offsets scaled by bank element size** — the fp16 `gate_up_global` bank was read with element offsets treated as bytes, zeroing half the experts at TP>1 (`9b0e853`)
@@ -115,9 +118,17 @@ Everything below landed after `v0.1.2` (2026-08-19). It currently lives on the
 - Server: DSML parser accepts the V4.1 tag spelling (`b63f5eb`); reasoning parser respects always-think chat templates (`bae5c5b`)
 - MoE: report the residency banks actually settle at (`831d38a`)
 - HF: download the shards the safetensors index names (`a80b4d3`)
+- Qwen3.8-27B-NVFP4 served its fp8 GDN projections as bf16 (compressed-tensors `ignore` matched as a subtree) (`50b629f`)
+- MTP chain refresh crashed the scheduler of a server without a draft head (`20d8a02`)
+- DSpark aborted at start since the overlap integration: the scheduler now picks the loop per speculative manager (`41562b1`)
+- FTW TP band load: fp8 banks crashed the in-memory slice (`056e333`); NVFP4 gate_up was sliced as one block and decoded garbage at TP=2 since `b5f9b45` (`0a04407`)
 
 ### Performance
 - MTP: one verify CUDA graph per padded batch size (`13d7f89`); pin FLA tensor caches after capture (`2fd9f60`); hoist the GDN commit's layer-invariant tensors out of the per-layer loop (`0e7d171`)
+- MTP round overhaul: decode-exact GDN verify + one-call commit, per-round split-KV re-plan of the verify/draft attention graphs, per-rank draft argmax; Qwen3.8-27B MTP 53 -> 88 tok/s at 1k and 29 -> 88 at 14k context (`20d8a02`)
+- Split-K small-M W8A16 fp8 GEMM for batched decode / MTP verify (`42cade6`); tail-wave-aware NVFP4 small-M split on smem-bound GPUs (`7e11dc6`)
+- WNA16 decode MoE GEMM: narrow tiles + deterministic split-K (`ed28aee`); one TP all_reduce for routed + shared experts (`c89ea83`) -- Qwen3.8-Flash-Next W4A16 plain decode 48.8 -> 55.2 tok/s
+- `--dense-fp8`: per-row fp8 (W8A16) for the bf16 dense linears at load -- Qwen3.8-Flash-Next plain decode NVFP4 57 -> 71, W4A16 53 -> 70 tok/s at 1k (`081ba3e`)
 - FTW: parallelize the down-family band read; load progress + CPU monitor; expert-load worker/flag knobs (`96697a9`)
 - Expert loading defaults to 16 workers (`7e71fd8`)
 

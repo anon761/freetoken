@@ -111,7 +111,8 @@ def _elsize(dt: torch.dtype) -> int:
 
 
 def _np_dtype(dt: torch.dtype):
-    """NumPy view dtype for a bank dtype (bfloat16 has no numpy dtype: view as uint16, byte-identical)."""
+    """NumPy view dtype for a bank dtype (bfloat16 / fp8 have no numpy dtype: viewed as the
+    same-width unsigned int, byte-identical -- the banks are only sliced, never computed on)."""
     import numpy as np
 
     return {
@@ -121,6 +122,8 @@ def _np_dtype(dt: torch.dtype):
         torch.int64: np.int64,
         torch.float16: np.float16,
         torch.bfloat16: np.uint16,
+        torch.float8_e4m3fn: np.uint8,
+        torch.float8_e5m2: np.uint8,
         torch.float32: np.float32,
     }[dt]
 
@@ -575,33 +578,19 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), workers: int | None = None
         raise err[0]
 
 
-def _intermediate_axis(base: str, shape: tuple[int, ...], hidden: int, intermediate: int, *, wna16: bool) -> int | None:
-    """Which axis of an FTW bank entry holds the TP-sliced intermediate dimension.
+def _band_axis(base: str, shape: tuple[int, ...], expert_quant: str | None) -> int | None:
+    """In-memory slice axis overriding ``_tp_band_plan``'s default, or None to keep it.
 
-    Two on-disk layouts share the bank names: ModelOpt NVFP4 (``[E, out, in]`` -- the
-    intermediate is the OUTPUT, axis 1 for gate_up / axis 2 for down) and AutoRound
-    WNA16 (``[E, packed_in, out]`` -- the intermediate is axis 2 for gate_up / axis 1
-    for down). Returns None for banks with no intermediate axis (globals).
-    """
-    if wna16:
-        if base.startswith("gate_up"):
-            return 2
-        if base.startswith("down") and len(shape) == 3:
-            return 1
+    Only AutoRound WNA16 banks (``[E, packed_in, out]``) need one: axis 2 for gate_up
+    (out == 2I), axis 1 for down (packed == I/8). NVFP4 banks (``[E, out, in]``) keep the
+    default -- gate_up is contiguous per expert and read as segments taking ``[lo, hi)``
+    from BOTH halves, down slices its last axis in memory."""
+    if expert_quant != "w4a16":
         return None
     if base.startswith("gate_up"):
-        if len(shape) >= 2 and shape[1] == 2 * intermediate:
-            return 1
-        if len(shape) >= 3 and shape[2] == 2 * intermediate:
-            return 2
-        return None
-    if base.startswith("down"):
-        if len(shape) == 2:
-            return None  # per-expert global: full-width on every rank
-        if shape[-1] == intermediate // 2:
-            return 2
-        if shape[1] == intermediate // 8:
-            return 1
+        return 2
+    if base.startswith("down") and len(shape) == 3:
+        return 1
     return None
 
 
@@ -882,7 +871,7 @@ def load_ftw_banks(
             # per-expert segments straight from the shard into it
             I_full, I_loc, lo, hi = tp_loc
             shape = tuple(e["shape"])
-            axis = _intermediate_axis(base, shape, model_config.hidden_size, I_full, wna16=(getattr(model_config, "expert_quant", None) == "w4a16")) if model_config is not None else None
+            axis = _band_axis(base, shape, getattr(model_config, "expert_quant", None))
             sliced, segs, mem_axis = _tp_band_plan(base, shape, lo, hi, I_full, I_loc, _elsize(_dtype_of(e["dtype"])), axis=axis)
             bank = HostBank(sliced, _dtype_of(e["dtype"]), backing=_backing(layer_id))
             row_hb[base].append(bank)

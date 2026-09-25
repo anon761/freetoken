@@ -26,7 +26,7 @@ class CompressedTensorsConfig(QuantConfig):
 
     def __init__(self, q: dict[str, Any], hf_config: Any = None, *, name_map=None, unquantized=()):
         super().__init__(name_map, unquantized)
-        self.ignore = ct_set(tuple(q.get("ignore") or ()), class_names=False)
+        self.ignore = ct_set(tuple(q.get("ignore") or ()), class_names=False, exact=True)
         groups = q.get("config_groups") or {}
         self.groups: list[tuple[Matcher, QuantScheme | None]] = []
         self.group_targets: list[tuple[tuple[str, ...], QuantScheme | None]] = []

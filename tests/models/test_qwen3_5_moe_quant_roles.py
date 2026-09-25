@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
-
 from freetoken.models.qwen3_5_moe.config import parse_config
 
 _LM = "model.language_model.layers.0"
@@ -92,3 +90,34 @@ def test_compressed_tensors_nvfp4_dense():
         }},
     }
     assert _roles(quant, num_experts=0) == ("none", "nvfp4", "nvfp4", "none", None)
+
+
+def test_gdn_split_fuse_matches_the_model_buffers():
+    # A hybrid compressed-tensors checkpoint (FP8 qkv|z, bf16 b|a) makes the model build the
+    # split GDN buffers (in_proj_qkvz fp8 + in_proj_ba bf16). The loader must fuse the bf16
+    # b|a into in_proj_ba, not the joint in_proj, which then never completes and the engine
+    # fails to load with "Incomplete bf16 fusions" (Qwen3.8-27B-NVFP4).
+    import torch
+
+    from freetoken.models.qwen3_5_moe import weight as W
+
+    class _Quant:
+        def __init__(self, fp8: bool):
+            self._fp8 = fp8
+
+        def scheme_for(self, prefix):
+            return object() if self._fp8 and prefix.endswith(".linear_attn.in_proj_qkvz") else None
+
+    split = _Quant(fp8=True)
+    assert W._gdn_split(split, "model.layers.0.linear_attn.in_proj_b") is True
+    assert W._gdn_split(split, "model.layers.0.linear_attn.in_proj_qkv") is True
+    assert W._gdn_split(split, "model.layers.0.self_attn.q_proj") is False
+    # a fully bf16 GDN keeps the joint in_proj fusion
+    assert W._gdn_split(_Quant(fp8=False), "model.layers.0.linear_attn.in_proj_b") is False
+
+    buf = {}
+    assert W._ct_bf16_fuse("model.layers.0.linear_attn.in_proj_b", torch.zeros(2), buf, W._CT_BF16_SPLIT_FUSE) == []
+    out = W._ct_bf16_fuse("model.layers.0.linear_attn.in_proj_a", torch.ones(2), buf, W._CT_BF16_SPLIT_FUSE)
+    assert [key for key, _ in out] == ["model.layers.0.linear_attn.in_proj_ba.weight"]
+    assert out[0][1].shape == (4,)
+    assert not buf

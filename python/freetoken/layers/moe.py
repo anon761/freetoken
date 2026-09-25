@@ -132,6 +132,7 @@ class MoELayer(BaseOP):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
+        reduce: bool = True,
     ):
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
@@ -139,7 +140,8 @@ class MoELayer(BaseOP):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
-        return self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
+        out = self._resident_gemm(hidden_states, topk_weights, topk_ids)
+        return self._maybe_all_reduce(out) if reduce else out
 
 
 class OffloadMoELayer(MoELayer):
@@ -190,13 +192,14 @@ class OffloadMoELayer(MoELayer):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
+        reduce: bool = True,
     ):
         ctx = get_global_ctx()
         if ctx.batch.is_prefill and not self._fetch_routed_only(hidden_states):
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
-        return self._maybe_all_reduce(final_hidden_states)
+        return self._maybe_all_reduce(final_hidden_states) if reduce else final_hidden_states
 
     def _fetch_routed_only(self, hidden_states: torch.Tensor) -> bool:
         """Whether to fetch on demand (decode-style) instead of streaming whole layers.
