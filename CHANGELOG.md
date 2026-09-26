@@ -28,6 +28,8 @@ Everything below landed after `v0.1.2` (2026-08-19). It currently lives on the
 - DSpark admission controller + fault latch (ported from DwarfStar), fed by serial-step timings (`9e5cd88`, `8567c98`)
 - vLLM-style rejection-sampling acceptance for DSpark verify (`d90ca7d`)
 - `--dspark-verify` flag plumbing (`67c30ee`)
+- DSpark cost-aware verify length: verifies the prefix that maximizes expected tokens per fitted verify cost, with a doubling drafter pause instead of a latch-off (`c1acdd3`)
+- Engram tables served from an FTW converted with `--include-engram` (`645b891`)
 
 **MTP (multi-token prediction / speculative decoding)**
 - Qwen4Exp draft head (Phase 0) + eager speculative decode rounds (`e2eb0ec`)
@@ -38,6 +40,9 @@ Everything below landed after `v0.1.2` (2026-08-19). It currently lives on the
 - Phase 2: commit the accepted prefix instead of re-extending (`8f95f0e`)
 - `--moe-verify-cpu` (MTP verify experts on the CPU executor) (`d99f252`)
 - Sampled-request MTP gated behind `FREETOKEN_MTP_SAMPLED` (default off) (`8b914e0`)
+- Standalone MTP INT4-g32 draft head (compressed-tensors) served and converted via `--mtp file --mtp-header` (`ec23068`)
+- CUDA-graph draft/verify capture with a private draft mempool, plus runtime knobs (`2df7700`, `e7e2c94`); fi verify/draft and the GDN commit graphed (`d42cf0e`)
+- Overlap scheduling: the verify is the overlapped batch (`6839d5b`)
 - Opt-in round chaining (`FREETOKEN_MTP_CHAIN`) (`a64e66d`)
 - Self-history n-gram draft combiner (`FREETOKEN_MTP_NGRAM`) (`d28592f`)
 - Frequency-adapted draft vocabulary (`--mtp-draft-vocab`) and fp8 draft head at load (`--mtp-head-fp8`) (`20d8a02`)
@@ -65,10 +70,15 @@ Everything below landed after `v0.1.2` (2026-08-19). It currently lives on the
 - Per-GPU memory ratio and GPU telemetry in the status lines (`1afcd8f`)
 - Env-backed runtime knobs exposed as CLI flags (`f95f4a3`)
 - `--swa-eviction-interval` (`0a6ac02`)
+- `--force-greedy` serves every request greedily (`7278367`)
+- `--moe-collect-stats`: decode expert-cache miss rate in the `Decode batch` status line (`625d895`)
+- `input_modalities` advertises `image` when the vision tower is loaded (`8ad5376`)
 
 **Models**
 - Qwen3.8-Flash-Next support (`bd8f3d5`, docs `a05c265`)
 - GLM-5.3-Flash support (`a2538a4`)
+- Qwen3.8-Flash-Next: selectable PLE dtype and vision tower (FTW + online `image_url` input, `--load-vision`) (`414f223`)
+- AutoRound W4A16 (INT4, group 128) routed experts: bank reader, dialect, FTW band layout, fused Triton decode + prefill kernel (`b5f9b45`)
 
 **MoE / residency**
 - Per-layer host-bank residency (split lock-CPU / pin-GPU layers, auto under a capped pin quota) (`c41833b`, `eebb3f5`, `831d38a`)
@@ -122,6 +132,14 @@ Everything below landed after `v0.1.2` (2026-08-19). It currently lives on the
 - MTP chain refresh crashed the scheduler of a server without a draft head (`20d8a02`)
 - DSpark aborted at start since the overlap integration: the scheduler now picks the loop per speculative manager (`41562b1`)
 - FTW TP band load: fp8 banks crashed the in-memory slice (`056e333`); NVFP4 gate_up was sliced as one block and decoded garbage at TP=2 since `b5f9b45` (`0a04407`)
+- Quant: compressed-tensors `naive-quantized` groups treated as unquantized (`9a2cc0d`)
+- MTP: draft-graph replay out of bounds (`60d2cda`); `mtp_chain` hang from a stale chain deferral (`7a6eed4`)
+- `qwen4_exp`: compressed-tensors NVFP4 expert global scale inverted (`db585ef`)
+- FTW: numpy view for every narrow bank dtype (e8m0 MXFP4 scales raised `KeyError`) (`53e7509`)
+- DeepSeek-V4.1: `hc_mixes` in 1024-token slices (`4f7606d`) and the Indexer prefill select in 2048-query slices (`243070a`) -- fp32 transients OOMed long prompts
+- MoE: free `gate_up` before `down` in the fp4 prefill (large-chunk peak OOM) (`b666b27`)
+- DSpark: the draft context tracks every processed position, serial decode steps included; per-request row state (acceptance 18 % -> 98 % on a counting prompt) (`3a2572b`)
+- Server: a backend death fails requests parked on their output (500 / cut stream instead of a hung connection) (`ccd06d2`); a scheduler worker that crashes mid-serve exits hard instead of blocking in NCCL teardown (`3ca4248`)
 
 ### Performance
 - MTP: one verify CUDA graph per padded batch size (`13d7f89`); pin FLA tensor caches after capture (`2fd9f60`); hoist the GDN commit's layer-invariant tensors out of the per-layer loop (`0e7d171`)
@@ -131,12 +149,16 @@ Everything below landed after `v0.1.2` (2026-08-19). It currently lives on the
 - `--dense-fp8`: per-row fp8 (W8A16) for the bf16 dense linears at load -- Qwen3.8-Flash-Next plain decode NVFP4 57 -> 71, W4A16 53 -> 70 tok/s at 1k (`081ba3e`)
 - FTW: parallelize the down-family band read; load progress + CPU monitor; expert-load worker/flag knobs (`96697a9`)
 - Expert loading defaults to 16 workers (`7e71fd8`)
+- FTW: parallel window reads + cached TP config for the dense load (`e3a1161`)
+- DeepSeek-V4.1 Engram: scales resident in RAM, only the value rows are pread (`c19cb6e`); every layer's prefill rows prefetched at the top of the forward (`bd87ef0`)
+- MoE: host expert banks in private anonymous memory with transparent hugepages (`2446191`)
 
 ### Documentation
 - DeepSeek-V4.1 port plan, checkpoint inventory and session logs (S1–S16)
 - MTP phase plan, round profiles and client benchmark harness
 - `SECURITY.md` (`4b94bdc`), `CONTRIBUTING.md` (`f0abe58`), `AGENTS.md` & `CLAUDE.md` (`9d32fa8`)
 - CLI help/docs completed for the newer flags (`f25ed56`)
+- `--enable-special-token-ckpt` checkpoints at the tool-call opener (`2245752`)
 
 ### CI / Build
 - Nightly wheels published to a rolling `nightly` release (`7dfc37a`), plus `engine-<platform>.json` manifests (`af71ba4`)
