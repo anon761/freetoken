@@ -14,6 +14,8 @@ class SchedulerStatusReporter:
     decode_log_interval: int = 40
     # Optional per-GPU telemetry segment appended to every emitted line; None = no segment.
     gpu_stats: Callable[[], str] | None = None
+    # Optional decode MoE-cache segment (miss rate since the last line); None = no segment.
+    moe_stats: Callable[[], str] | None = None
     _last_prefill_time: float = field(init=False)
     _last_decode_time: float = field(init=False)
     _decode_forward_count: int = field(default=0, init=False)
@@ -124,8 +126,18 @@ class SchedulerStatusReporter:
             f"{_mamba_msg(mamba_slots)}"
             f"gen throughput (token/s): {gen_throughput:.2f}, "
             f"#queue-req: {queue_reqs}"
+            f"{self._moe_msg()}"
             f"{self._gpu_msg()}"
         )
+
+    def _moe_msg(self) -> str:
+        if self.moe_stats is None:
+            return ""
+        try:
+            segment = self.moe_stats()
+        except Exception:  # noqa: BLE001 -- diagnostics must never break the status line
+            return ""
+        return f", moe: {segment}" if segment else ""
 
     def _gpu_msg(self) -> str:
         """The trailing GPU telemetry segment, or "" when unavailable/disabled.

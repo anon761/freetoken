@@ -22,10 +22,11 @@ compressed-id cache is keyed by page-table row (continuous-batching safe).
 
 from __future__ import annotations
 
+import bisect
 import json
 import mmap
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -37,6 +38,8 @@ from .args import DeepseekV41Args
 _ENGRAM_VOCAB_FILE = "engram-vocab.json"
 _ROW_BYTES = 256
 _SCALE_BYTES = 8
+# engram value-read threads: ZFS serves ~5 cold random reads in parallel, more never helped
+_READ_WORKERS = 8
 # Prefill micro-batch (tokens per engram forward slice): the gate math is
 # per-token independent, but its fp32 transients (hash gather, h/key casts)
 # scale with the prefill chunk — one whole --max-extend-tokens chunk (8192)
@@ -178,10 +181,19 @@ class EngramLayout:
 
 # --------------------------------------------------------------------- disk rows
 class EngramRowSource:
-    """In-place ``pread`` access to one layer's engram table in the raw
-    checkpoint's safetensors shards (values uint8 fp8-codes [rows, 256],
-    scales e8m0 [rows, 8]). Reads happen on a thread pool (os.pread releases
-    the GIL); the OS page cache holds the hot rows."""
+    """In-place ``pread`` access to one layer's engram table (values uint8 fp8-codes
+    [rows, 256], scales e8m0 [rows, 8]) — in the raw checkpoint's safetensors shards or,
+    for an FTW converted with ``--include-engram``, in the FTW shards (a table spans
+    several of them). Each table is a list of segments ``(row_lo, row_hi, path, off)``;
+    value reads run on a thread pool (os.pread releases the GIL), the OS page cache holds
+    the hot rows.
+
+    The scale table (8 B/row, ~3 GiB per layer) is read into RAM once: a random 8-byte
+    pread costs as much as the 256-byte value read (on ZFS both fetch a whole record,
+    ~0.3 ms cold), so resident scales halve the reads on the decode critical path."""
+
+    # the mmap subclass gathers scales from its mappings instead
+    _RESIDENT_SCALES = True
 
     @staticmethod
     def _load_weight_map(model_path: str) -> dict:
@@ -193,31 +205,90 @@ class EngramRowSource:
 
     def __init__(self, model_path: str, layer_id: int, prefix: str):
         self._prefix = prefix
+        keys = {"w": f"{prefix}.embed.weight", "s": f"{prefix}.embed.scale"}
+        widths = {"w": _ROW_BYTES, "s": _SCALE_BYTES}
+        segs = self._ftw_segments(model_path, keys, widths)
+        if segs is None:
+            segs = self._safetensors_segments(model_path, keys)
+        self._segs: dict[str, list[tuple[int, int, str, int]]] = segs
+        self._starts = {k: [lo for lo, _, _, _ in v] for k, v in segs.items()}
+        self.rows = segs["w"][-1][1]
+        self._fds: dict[str, int] = {}
+        self._pool = ThreadPoolExecutor(max_workers=_READ_WORKERS)
+        self._scales: np.ndarray | None = self._load_scales() if self._RESIDENT_SCALES else None
+
+    def _load_scales(self) -> np.ndarray:
+        """The whole scale table as one [rows, 8] uint8 array (sequential reads)."""
+        rows = self._segs["s"][-1][1]
+        scales = np.empty((rows, _SCALE_BYTES), dtype=np.uint8)
+        flat = scales.reshape(-1)
+        for lo, hi, path, off in self._segs["s"]:
+            view = memoryview(flat[lo * _SCALE_BYTES : hi * _SCALE_BYTES])
+            with open(path, "rb", buffering=0) as f:
+                f.seek(off)
+                done = 0
+                while done < len(view):
+                    n = f.readinto(view[done:])
+                    if not n:
+                        raise EOFError(f"engram {self._prefix}.embed.scale: {path} ends inside the table")
+                    done += n
+        return scales
+
+    @staticmethod
+    def _ftw_segments(model_path: str, keys: dict, widths: dict):
+        """Segments from an FTW that carries the table (``--include-engram``), else None."""
+        from freetoken.checkpoint.ftw import FTWReader, is_ftw_checkpoint
+
+        if not is_ftw_checkpoint(model_path):
+            return None
+        reader = FTWReader(model_path)
+        try:
+            names = {k: next((n for n in (key, "model." + key) if n in reader.tensors), None) for k, key in keys.items()}
+            if None in names.values():
+                return None
+            out = {}
+            for k, name in names.items():
+                segs, row = [], 0
+                for path, off, n in reader.file_pieces(name):
+                    if n % widths[k]:
+                        raise ValueError(f"engram {name}: shard piece of {n} B splits a {widths[k]} B row")
+                    segs.append((row, row + n // widths[k], path, off))
+                    row += n // widths[k]
+                out[k] = segs
+            return out
+        finally:
+            reader.close()
+
+    def _safetensors_segments(self, model_path: str, keys: dict) -> dict:
+        """One segment per table from the raw checkpoint's safetensors shards; an FTW
+        without the tables falls back to the raw checkpoint next to it (``<name>`` for
+        ``<name>-FTW``)."""
         weight_map = self._load_weight_map(model_path)
-        if prefix + ".embed.weight" not in weight_map:
-            # the FTW carries no engram tables (the Phase-2 reader skips them) —
-            # the raw checkpoint stays on disk as the O_DIRECT source
+        if keys["w"] not in weight_map:
             raw = model_path[: -len("-FTW")] if model_path.endswith("-FTW") else model_path
-            if raw != model_path:
-                raw_map = self._load_weight_map(raw)
-                if prefix + ".embed.weight" in raw_map:
-                    model_path, weight_map = raw, raw_map
-        self._entries: dict[str, tuple[str, int]] = {}
-        self._sizes: dict[str, int] = {}
-        header_sizes: dict[str, int] = {}
-        for key in (f"{prefix}.embed.weight", f"{prefix}.embed.scale"):
-            shard = weight_map[key]
-            path = os.path.join(model_path, shard)
+            raw_map = self._load_weight_map(raw) if raw != model_path else {}
+            if keys["w"] not in raw_map:
+                raise FileNotFoundError(
+                    f"engram table {keys['w']} is neither in {model_path} nor in a raw checkpoint "
+                    f"at {raw} — convert with --include-engram or keep the raw checkpoint"
+                )
+            model_path, weight_map = raw, raw_map
+        out = {}
+        for k, key in keys.items():
+            path = os.path.join(model_path, weight_map[key])
             with open(path, "rb") as f:
                 n = int.from_bytes(f.read(8), "little")
                 header = json.loads(f.read(n))
-                header_sizes[path] = 8 + n
             start, end = header[key]["data_offsets"]
-            self._entries[key] = (path, header_sizes[path] + start)
-            self._sizes[key] = end - start
-        self.rows = self._sizes[f"{prefix}.embed.weight"] // _ROW_BYTES
-        self._fds: dict[str, int] = {}
-        self._pool = ThreadPoolExecutor(max_workers=8)
+            width = _ROW_BYTES if k == "w" else _SCALE_BYTES
+            out[k] = [(0, (end - start) // width, path, 8 + n + start)]
+        return out
+
+    def _where(self, k: str, row: int) -> tuple[str, int]:
+        i = bisect.bisect_right(self._starts[k], row) - 1
+        lo, _, path, off = self._segs[k][i]
+        width = _ROW_BYTES if k == "w" else _SCALE_BYTES
+        return path, off + (row - lo) * width
 
     def _fd(self, path: str) -> int:
         if path not in self._fds:
@@ -226,63 +297,69 @@ class EngramRowSource:
 
     def read_rows(self, indices: torch.Tensor, out: torch.Tensor) -> None:
         """Rows ``indices`` (int64 CPU [N]) → ``out`` uint8 [N, 264] (256 value
-        bytes + 8 scale bytes, written by one task per index)."""
-        (vpath, voff) = self._entries[f"{self._prefix}.embed.weight"]
-        (spath, soff) = self._entries[f"{self._prefix}.embed.scale"]
-        vf, sf = self._fd(vpath), self._fd(spath)
+        bytes pread on the pool, one contiguous run of rows per worker + 8 scale
+        bytes gathered from the resident table)."""
         idx = indices.tolist()
         nv = len(idx)
+        o = out.numpy()
+        o[:, _ROW_BYTES:] = self._scales[indices.to(torch.int64).numpy()]
 
         def work(lo: int, hi: int) -> None:
             for i in range(lo, hi):
-                r = idx[i]
-                out[i, :_ROW_BYTES] = torch.frombuffer(
-                    bytearray(os.pread(vf, _ROW_BYTES, voff + r * _ROW_BYTES)), dtype=torch.uint8
-                )
-                out[i, _ROW_BYTES:] = torch.frombuffer(
-                    bytearray(os.pread(sf, _SCALE_BYTES, soff + r * _SCALE_BYTES)), dtype=torch.uint8
-                )
+                vpath, voff = self._where("w", idx[i])
+                o[i, :_ROW_BYTES] = np.frombuffer(os.pread(self._fd(vpath), _ROW_BYTES, voff), dtype=np.uint8)
 
-        step = max(1, nv // 16)
+        step = max(1, -(-nv // _READ_WORKERS))
         futures = [self._pool.submit(work, lo, min(lo + step, nv)) for lo in range(0, nv, step)]
         for f in futures:
             f.result()
 
 
 class RamEngramRowSource(EngramRowSource):
-    """mmap variant of :class:`EngramRowSource` (``--engram-backend ram``): the
-    layer's weight/scale regions are mmap'd and the OS is asked to fault the
-    whole table in once at bind (``MADV_WILLNEED``); reads gather from the
-    mapping. Page-cache resident and evictable under pressure — no ~189 GiB
-    anonymous allocation, and the read is one bulk pass instead of cold random
+    _RESIDENT_SCALES = False
+
+    """mmap variant of :class:`EngramRowSource` (``--engram-backend ram``): every segment is
+    mmap'd and the OS is asked to fault it in once at bind (``MADV_WILLNEED``); reads
+    gather from the mappings. Page-cache resident and evictable under pressure — no
+    ~189 GiB anonymous allocation, and the read is one bulk pass instead of cold random
     preads."""
 
     def __init__(self, model_path: str, layer_id: int, prefix: str):
         super().__init__(model_path, layer_id, prefix)
         self._maps: dict[str, mmap.mmap] = {}
-        self._arrays: dict[str, np.ndarray] = {}
-        for key in (f"{prefix}.embed.weight", f"{prefix}.embed.scale"):
-            path, off = self._entries[key]
-            size = self._sizes[key]
-            if path not in self._maps:
-                fd = os.open(path, os.O_RDONLY)
+        self._arrays: dict[str, list[np.ndarray]] = {}
+        for k, segs in self._segs.items():
+            width = _ROW_BYTES if k == "w" else _SCALE_BYTES
+            arrays = []
+            for lo, hi, path, off in segs:
+                if path not in self._maps:
+                    fd = os.open(path, os.O_RDONLY)
+                    try:
+                        self._maps[path] = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
+                    finally:
+                        os.close(fd)
+                mm = self._maps[path]
+                size = (hi - lo) * width
                 try:
-                    self._maps[path] = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
-                finally:
-                    os.close(fd)
-            mm = self._maps[path]
-            try:
-                mm.madvise(mmap.MADV_WILLNEED, off, size)  # one bulk read into the page cache
-            except (AttributeError, OSError):  # pragma: no cover — platform-dependent
-                pass  # unsupported: fall back to lazy page faults on access
-            self._arrays[key] = np.frombuffer(mm, dtype=np.uint8, count=size, offset=off)
-        self._w = self._arrays[f"{prefix}.embed.weight"].reshape(-1, _ROW_BYTES)
-        self._s = self._arrays[f"{prefix}.embed.scale"].reshape(-1, _SCALE_BYTES)
+                    mm.madvise(mmap.MADV_WILLNEED, off - off % mmap.PAGESIZE, size + off % mmap.PAGESIZE)
+                except (AttributeError, OSError):  # pragma: no cover — platform-dependent
+                    pass  # unsupported: fall back to lazy page faults on access
+                arrays.append(np.frombuffer(mm, dtype=np.uint8, count=size, offset=off).reshape(-1, width))
+            self._arrays[k] = arrays
 
     def read_rows(self, indices: torch.Tensor, out: torch.Tensor) -> None:
         idx = indices.to(torch.int64).numpy()
-        out[:, :_ROW_BYTES].numpy()[...] = self._w[idx]
-        out[:, _ROW_BYTES:].numpy()[...] = self._s[idx]
+        seg = np.searchsorted(np.asarray(self._starts["w"]), idx, side="right") - 1
+        o = out.numpy()
+        for si, (lo, _, _, _) in enumerate(self._segs["w"]):
+            sel = np.nonzero(seg == si)[0]
+            if sel.size:
+                o[sel, :_ROW_BYTES] = self._arrays["w"][si][idx[sel] - lo]
+        sseg = np.searchsorted(np.asarray(self._starts["s"]), idx, side="right") - 1
+        for si, (lo, _, _, _) in enumerate(self._segs["s"]):
+            sel = np.nonzero(sseg == si)[0]
+            if sel.size:
+                o[sel, _ROW_BYTES:] = self._arrays["s"][si][idx[sel] - lo]
 
 
 def make_engram_row_source(model_path: str, layer_id: int, prefix: str) -> EngramRowSource:
@@ -322,6 +399,9 @@ class Engram(BaseOP):
         self._token_cache: torch.Tensor | None = None  # [cache_rows, max_seq] int64
         self._device: torch.device | None = None
         self._scratch: torch.Tensor | None = None  # CPU staging [M, 264] uint8
+        # prefill prefetch: (positions tensor it was started for, row count, Future)
+        self._pending: tuple[torch.Tensor, int, Future] | None = None
+        self._prefetcher = ThreadPoolExecutor(max_workers=1)
         # decode (CUDA-graph) path: the host fills these BEFORE the dispatch
         # (rows pre-read from disk); the graph only does the H2D + dequant
         self._graph_pinned: torch.Tensor | None = None   # [max_bs, 264*n_hash_cols] uint8 CPU
@@ -401,6 +481,32 @@ class Engram(BaseOP):
         gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(self.clamp_value).sqrt(), dot))
         return (R + (gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(R.dtype))
 
+    def prefetch_rows(self, comp_ids: torch.Tensor, cache_rows: torch.Tensor, positions: torch.Tensor) -> None:
+        """PREFILL: persist this chunk's compressed ids, hash every token's 2/3/4-gram
+        lookback and start the disk gather of its rows on a background thread (one
+        host sync for the row ids). The model calls this for every engram layer before
+        the layer loop, so a later engram layer's read overlaps the earlier layers'
+        compute; :meth:`forward` awaits it."""
+        if os.path.exists("/tmp/dsv41-no-engram"):
+            return
+        self._token_cache[cache_rows, positions] = comp_ids
+        M = positions.shape[0]
+        pad = self._vocab[self.pad_token_id]
+        tokens = torch.full((M, self.n_sizes + 1), pad, dtype=torch.int64, device=positions.device)
+        blocked = torch.zeros(M, dtype=torch.bool, device=positions.device)
+        for shift in range(self.n_sizes + 1):
+            src = self._token_cache[cache_rows, (positions - shift).clamp_min(0)]
+            blocked = blocked | (positions < shift)
+            tokens[:, shift] = torch.where(blocked, pad, src)
+        rows = self._layout.rows_for(self.layer_id, tokens).view(-1).cpu()  # [M*24]
+        n = rows.numel()
+        if self._scratch is None or self._scratch.shape[0] < n:
+            # written from the reader threads, outside the forward's inference_mode
+            with torch.inference_mode(False):
+                self._scratch = torch.empty(n, _ROW_BYTES + _SCALE_BYTES, dtype=torch.uint8)
+        future = self._prefetcher.submit(self._source.read_rows, rows, self._scratch[:n])
+        self._pending = (positions, n, future)
+
     def forward(self, R: torch.Tensor, comp_ids: torch.Tensor, cache_rows: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """PREFILL path (eager): R [M, hc, dim] raw residual stream (M = flat
         tokens); comp_ids [M] compressed ids of this step's tokens;
@@ -412,29 +518,23 @@ class Engram(BaseOP):
             return R  # rows are gathered (cache warm) but the gate add is skipped
         M = R.shape[0]
         hc, dim = self.hc_mult, self.dim
-        # 1. persist this step's compressed ids (whole chunk, once)
-        self._token_cache[cache_rows, positions] = comp_ids
+        # 1.-3. ids persisted, hashed and the disk gather started — normally already
+        # done by prefetch_rows at the top of the forward, so the read overlapped the
+        # layers before this one; only its completion is awaited here.
+        pending = self._pending
+        self._pending = None
+        if pending is None or pending[0] is not positions or pending[1] != M * self.n_hash_cols:
+            self.prefetch_rows(comp_ids, cache_rows, positions)
+            pending, self._pending = self._pending, None
+        pending[2].result()
+        rows_all = self._scratch[: M * self.n_hash_cols]
         weight = self.q_weight.float() * self.k_weight.float()  # per-layer constant
         out = torch.empty_like(R)
-        # 2.-4. in micro-batches: every step below is per-token independent, so
+        # 4. in micro-batches: every step below is per-token independent, so
         # slicing M only bounds the fp32 transients, never the result
         for s in range(0, M, _PREFILL_MICRO_BS):
             e = min(s + _PREFILL_MICRO_BS, M)
-            # 2. hash: 2/3/4-gram lookback out of the cache (pad past the sequence start)
-            pad = self._vocab[self.pad_token_id]
-            tokens = torch.full((e - s, self.n_sizes + 1), pad, dtype=torch.int64, device=R.device)
-            blocked = torch.zeros(e - s, dtype=torch.bool, device=R.device)
-            for shift in range(self.n_sizes + 1):
-                src = self._token_cache[cache_rows[s:e], (positions[s:e] - shift).clamp_min(0)]
-                blocked = blocked | (positions[s:e] < shift)
-                tokens[:, shift] = torch.where(blocked, pad, src)
-            rows = self._layout.rows_for(self.layer_id, tokens).view(-1)  # [m*24]
-            # 3. disk gather + dequant (CPU pread → device)
-            n = rows.numel()
-            if self._scratch is None or self._scratch.shape[0] < n:
-                self._scratch = torch.empty(n, _ROW_BYTES + _SCALE_BYTES, dtype=torch.uint8)
-            scratch = self._scratch[:n]
-            self._source.read_rows(rows.cpu(), scratch)
+            scratch = rows_all[s * self.n_hash_cols : e * self.n_hash_cols]
             vals = scratch[:, :_ROW_BYTES].to(R.device).view(torch.float8_e4m3fn).float()
             scales = scratch[:, _ROW_BYTES:].to(R.device).view(torch.uint8).float()
             scales = torch.exp2(scales - 127.0)

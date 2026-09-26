@@ -129,9 +129,7 @@ class Block(BaseOP):
     # ----- prefill (ragged batched; x streams are [M, hc, dim], M = flat tokens) -----
     def prefill_batched(self, R, pre_mix, segments, flat_positions, shared):
         if self.engram is not None:
-            rows = torch.cat([torch.full((n,), ti, dtype=torch.int64, device=R.device)
-                              for _off, n, ti, _start in segments])
-            R = self.engram.forward(R, shared["comp_ids"], rows, flat_positions)
+            R = self.engram.forward(R, shared["comp_ids"], shared["engram_rows"], flat_positions)
         pre_a, post_a, comb_a = self._split(R, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = hc_collapse(R, pre_mix, R.dtype) if pre_mix is not None else R[:, 0]
         x = self.attn_norm.forward(x)
@@ -210,13 +208,18 @@ class Transformer(BaseOP):
             _DSparkAuxCapture(args.dspark_target_layer_ids) if self.mtp is not None else None
         )
         self._dspark_aux_hidden: torch.Tensor | None = None
+        # decode-step aux (graph-captured writes, bound with the draft): the DSpark
+        # manager appends a serially decoded position to the draft context from it
+        self._dspark_decode_aux: torch.Tensor | None = None
+        self._dspark_aux_slot: dict[int, int] = (
+            {int(t): i for i, t in enumerate(args.dspark_target_layer_ids)} if self.mtp is not None else {}
+        )
 
     def bind(self, pool, device: torch.device) -> None:
         # two rope regimes (ratio-0 plain theta vs compressed yarn), one table each,
         # shared by the layers of that regime; sized to the SERVED ceiling
         # (args.max_seq_len is _adjust_dsv4_config's resolved runtime cap).
         args = self.args
-        rd = args.qk_rope_head_dim
         tables: dict[tuple, torch.Tensor] = {}
         for layer in self.layers.op_list:
             key = layer.attn._freqs_params
@@ -235,12 +238,23 @@ class Transformer(BaseOP):
         # served decode batch (max_running_req + 1 dummy, set by _adjust_dsv4_config).
         if self.mtp is not None:
             self.mtp.bind(device, args.max_batch_size, self.embed, self.head)
+            self._dspark_decode_aux = torch.zeros(
+                args.max_batch_size, args.hidden_size * len(self._dspark_aux_slot),
+                dtype=torch.bfloat16, device=device,
+            )
 
     def prefill_batched(self, input_ids: torch.Tensor, segments, flat_positions, shared: dict, logits_all: bool = False) -> torch.Tensor:
         hc = self.hc_mult
         e = self.embed.forward(input_ids.view(-1))  # [T, dim]
         R = e.unsqueeze(1).expand(-1, hc, -1).contiguous()
         pre_mix: torch.Tensor | None = None
+        # every engram layer's disk gather starts now, so a later engram layer's read
+        # overlaps the compute of the layers before it (Engram.prefetch_rows)
+        shared["engram_rows"] = torch.cat([torch.full((n,), ti, dtype=torch.int64, device=R.device)
+                                           for _off, n, ti, _start in segments])
+        for layer in self.layers.op_list:
+            if layer.engram is not None:
+                layer.engram.prefetch_rows(shared["comp_ids"], shared["engram_rows"], flat_positions)
         capture = self.aux_capture
         if capture is not None:
             capture.reset()
@@ -264,8 +278,15 @@ class Transformer(BaseOP):
         e = self.embed.forward(input_ids.view(-1))  # [B, dim]
         R = e.unsqueeze(1).expand(-1, hc, -1).contiguous()
         pre_mix: torch.Tensor | None = None
+        aux = self._dspark_decode_aux
+        dim = R.shape[-1]
         for layer in self.layers.op_list:
             R, pre_mix = layer.decode_step(R, pre_mix, pos, rows, cmp_stage_cap, wctx, shared)
+            slot = self._dspark_aux_slot.get(layer.layer_id + 1) if aux is not None else None
+            if slot is not None:
+                # same capture as the prefill (_DSparkAuxCapture): input of the target layer,
+                # mean over the hc copies
+                aux[:B, slot * dim : (slot + 1) * dim].copy_(R.mean(dim=1))
         x = hc_collapse(R, pre_mix, R.dtype)
         x = self.norm.forward(x)
         return self.head.forward(x)
@@ -292,7 +313,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
 
     def _comp_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Compressed engram ids for this step's tokens (bound after bind)."""
-        layer = next(l for l in self.model.layers.op_list if l.engram is not None)
+        layer = next(lay for lay in self.model.layers.op_list if lay.engram is not None)
         return layer.engram._vocab[input_ids.view(-1).long()]
 
     def dspark_draft(self):
@@ -302,6 +323,11 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
     def dspark_compressors(self) -> list:
         """The kv-source V41Compressors carrying per-layer state (rollback hook)."""
         return [b.attn.compressor for b in self.model.layers.op_list if b.attn.compressor is not None]
+
+    def get_dspark_decode_aux(self) -> torch.Tensor | None:
+        """Target aux hidden of the last DECODE step, one row per batch row ``[max_bs,
+        hidden * len(dspark_target_layer_ids)]``; None when MTP is off."""
+        return self.model._dspark_decode_aux
 
     def get_dspark_aux_hidden(self) -> torch.Tensor | None:
         """Target aux hidden of the last prefill/verify forward: ``[T, hidden * len(
@@ -313,7 +339,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         """Engram disk tables: the compressed vocab, hash layout and the per-layer
         O_DIRECT row sources + pinned decode staging. The ~189 GiB tables stay in
         the raw checkpoint's shards (O_DIRECT pread) — no VRAM, no pin budget."""
-        engram_layers = [l for l in self.model.layers.op_list if l.engram is not None]
+        engram_layers = [lay for lay in self.model.layers.op_list if lay.engram is not None]
         if not engram_layers:
             return 0
         from .engram import EngramLayout, build_compressed_vocab

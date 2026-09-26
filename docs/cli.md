@@ -107,6 +107,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; every value needs an expert format the CPU executor serves (bf16, nvfp4, mxfp4), so fp8 experts cannot use it |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
+| `--moe-collect-stats` | off | Decode: count expert-cache misses; the status line shows the miss rate |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 | `--expert-load` | auto | How expert banks are read into host RAM: `auto` (parallel for scattered experts, serial when RAM is tight), `serial`, `parallel` |
 | `--expert-load-workers` | 16 | Parallel expert-bank reader thread count |
@@ -177,7 +178,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--dummy-weight` | off | Fabricate random weights (loader/kernel smoke tests, no checkpoint) |
 | `--disable-pynccl` | off | Use torch.distributed instead of PyNCCL for TP |
 | `--model-source` | huggingface | Where `--model` ids are resolved (`huggingface`/`modelscope`) |
-| `--enable-special-token-ckpt` | off | Allow a checkpoint whose tokenizer lacks special tokens |
+| `--enable-special-token-ckpt` | off | Keep a reuse point just after the tool-call opener (GDN-hybrid and SWA models): a client that rewrites the echoed tool call only invalidates the call body, not the turn |
 | `--cors-origins` | built-in | Extra allowed CORS origins (comma-separated) |
 | `--shell-mode` | off | Interactive shell mode for the serve process |
 | `--dspark-debug` / `--dspark-diff` / `--dspark-timing` / `--dspark-force-a0` | off | DSpark diagnostics: verbose draft logs / decode-vs-verify harness / per-round timing / never accept drafts |

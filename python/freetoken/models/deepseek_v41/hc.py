@@ -21,6 +21,12 @@ from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
 from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
 
 
+# Tokens per hc_mixes slice: the fp32 stream copy and its square cost 2 x 64 KiB per token,
+# ~0.5 GiB for a 4096-token prefill chunk — the peak that OOMs once the expert cache has
+# the rest of the card. Per-token independent math: slicing changes only fp32 GEMM rounding.
+_MIXES_MICRO_BS = 1024
+
+
 def hc_mixes(
     R: torch.Tensor, hc_fn: torch.Tensor, norm_eps: float
 ) -> torch.Tensor:
@@ -28,6 +34,16 @@ def hc_mixes(
 
     R [M, hc, dim] (bf16) -> mixes [M, (2+hc)*hc] fp32.
     """
+    M = R.shape[0]
+    if M <= _MIXES_MICRO_BS:
+        return _hc_mixes_slice(R, hc_fn, norm_eps)
+    out = torch.empty(M, hc_fn.shape[0], dtype=torch.float32, device=R.device)
+    for s in range(0, M, _MIXES_MICRO_BS):
+        out[s : s + _MIXES_MICRO_BS] = _hc_mixes_slice(R[s : s + _MIXES_MICRO_BS], hc_fn, norm_eps)
+    return out
+
+
+def _hc_mixes_slice(R: torch.Tensor, hc_fn: torch.Tensor, norm_eps: float) -> torch.Tensor:
     xf = R.flatten(1).float()
     rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + norm_eps)
     return F.linear(xf, hc_fn) * rsqrt

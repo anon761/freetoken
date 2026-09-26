@@ -162,10 +162,30 @@ class Scheduler(SchedulerIOMixin):
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
             gpu_stats=self._make_gpu_stats(),
+            moe_stats=self._make_moe_stats(),
         )
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
+
+    def _make_moe_stats(self) -> Callable[[], str] | None:
+        """With --moe-collect-stats: the decode expert-cache miss rate since the last status
+        line (the counters reset after each read), on the logging rank only."""
+        cache = getattr(self.engine, "moe_offload_cache", None)
+        if cache is None or not cache.collect_stats or not self.config.tp_info.is_primary():
+            return None
+
+        def segment() -> str:
+            s = cache.decode_miss_stats()
+            cache.reset_stats()
+            if not s["layer_calls"]:
+                return ""
+            return (
+                f"miss {s['miss_rate']:.2f} "
+                f"({s['missing_per_layer']:.1f}/{s['active_per_layer']:.1f} experts/layer/step)"
+            )
+
+        return segment
 
     def _make_gpu_stats(self) -> Callable[[], str] | None:
         """The status line's per-GPU telemetry callback, or None when disabled or not rank 0.
@@ -437,11 +457,20 @@ class Scheduler(SchedulerIOMixin):
                 if mtp.enabled and forward_input.batch.is_prefill
                 else None
             )
+            note_decode = getattr(mtp, "note_decode", None) if mtp.enabled else None
+            pre_pos = (
+                [r.device_len - 1 for r in forward_input.batch.reqs]
+                if note_decode is not None and getattr(forward_input.batch, "is_decode", False)
+                else None
+            )
             ongoing_data = (forward_input, self._forward(forward_input))
             if pre_lens is not None:
                 # Build the MTP block's own KV for the freshly forwarded extends while
                 # the streams are at hand; the drain then publishes as usual.
                 mtp.draft_prefill(forward_input.batch, pre_lens)
+            if pre_pos is not None:
+                # the serially decoded positions join the speculative draft's context
+                note_decode(forward_input.batch, pre_pos)
 
         if _sched_timing:
             _t3 = _time.perf_counter()
@@ -1081,6 +1110,15 @@ class Scheduler(SchedulerIOMixin):
             # pending tokens out of a plain decode step, which under CUDA-graph
             # replay would clear their streams and knock them out of MTP for good.
             batch.reqs = [r for r in batch.reqs if r not in self.mtp._deferred]
+            if not batch.reqs:
+                return None
+        advanced = getattr(mtp, "_spec_iter", None)
+        if getattr(batch, "is_decode", False) and advanced:
+            # A speculative round already advanced these requests this iteration and left
+            # their bonus token pending for the NEXT round's verify: a plain step here would
+            # process it outside the round (a redundant decode per round, and a DSpark draft
+            # context that misses that position).
+            batch.reqs = [r for r in batch.reqs if r.table_idx not in advanced]
             if not batch.reqs:
                 return None
         forward_input = self._prepare_batch(batch)

@@ -36,6 +36,10 @@ from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 
 from .args import DeepseekV41Args
 
+# Prefill queries per indexer select slice: bounds the [queries, compressed rows] fp32 scores
+# (~120 MiB per copy at 60k context) instead of materializing them for the whole chunk.
+_SELECT_MICRO_Q = 2048
+
 
 class V41Indexer(BaseOP):
     def __init__(self, config, layer_id: int, args: DeepseekV41Args, *, quant_config=None, prefix: str = ""):
@@ -135,8 +139,6 @@ class V41Indexer(BaseOP):
 
     def static_prefill(self, start_pos: int, n: int, ti: int):
         """Phase-3a fallback: all valid compressed blocks as candidates."""
-        import os
-
         device = get_global_ctx().attn_backend.device
         ratio = self.src_ratio
         if start_pos == 0:
@@ -169,18 +171,29 @@ class V41Indexer(BaseOP):
         fp4_act_quant_inplace(q, 32)
         weights = self.weights_proj.forward(x) * self.scale_folded
         keys = self.attn.indexer_keys(ti, n_rows, self.src_ratio, self.layer_id, bsz=1)
-        scores = self.attn.indexer_prefill_logits(q, keys, weights)  # [1, n, n_rows]
         live = ((start_pos + torch.arange(1, n + 1, device=device)) // self.src_ratio).unsqueeze(-1)
         if "candidates_list" not in shared:
             shared["candidates_list"] = {}
         if self.is_candidate_source:
-            shared["candidates_list"][seg_i] = self._candidate_mask(scores, live.squeeze(-1))
-        elif self.uses_candidates:
-            scores = scores.masked_fill(~shared["candidates_list"][seg_i], float("-inf"))
-        scores = scores.masked_fill(torch.arange(n_rows, device=device) >= live, float("-inf"))
+            shared["candidates_list"][seg_i] = torch.empty(1, n, n_rows, dtype=torch.bool, device=device)
+        candidates = shared["candidates_list"].get(seg_i) if (self.is_candidate_source or self.uses_candidates) else None
         topk = min(self.index_topk, n_rows)
-        picks = scores.topk(topk, dim=-1)[1].sort(dim=-1).values
-        picks = torch.where(picks < live, picks, -1)
+        cols = torch.arange(n_rows, device=device)
+        picks = torch.empty(1, n, topk, dtype=torch.int64, device=device)
+        # Query slices: the fp32 scores (and every masked copy of them) are [queries, n_rows],
+        # so a whole chunk late in a long prompt peaks at several GiB. Selection is per query,
+        # so slicing bounds the transient without changing a pick.
+        for s in range(0, n, _SELECT_MICRO_Q):
+            e = min(s + _SELECT_MICRO_Q, n)
+            scores = self.attn.indexer_prefill_logits(q[:, s:e], keys, weights[:, s:e])  # [1, m, n_rows]
+            live_s = live[s:e]
+            if self.is_candidate_source:
+                candidates[:, s:e] = self._candidate_mask(scores, live_s.squeeze(-1))
+            elif self.uses_candidates:
+                scores = scores.masked_fill_(~candidates[:, s:e], float("-inf"))
+            scores = scores.masked_fill_(cols >= live_s, float("-inf"))
+            sel = scores.topk(topk, dim=-1)[1].sort(dim=-1).values
+            picks[:, s:e] = torch.where(sel < live_s, sel, -1)
         return self.attn.blocks_to_global(picks, self.src_ratio, ti=ti).int()
 
     def decode_select(self, x, qr, pos, latent, should, rows, shared: dict, cmp_stage_cap: int):

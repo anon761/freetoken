@@ -111,21 +111,22 @@ def _elsize(dt: torch.dtype) -> int:
 
 
 def _np_dtype(dt: torch.dtype):
-    """NumPy view dtype for a bank dtype (bfloat16 / fp8 have no numpy dtype: viewed as the
-    same-width unsigned int, byte-identical -- the banks are only sliced, never computed on)."""
+    """NumPy view dtype for a bank dtype. Types numpy lacks (bfloat16, every fp8/e8m0/fp4
+    flavour) are viewed as the same-width unsigned int, byte-identical -- the banks are only
+    sliced, never computed on."""
     import numpy as np
 
-    return {
+    native = {
         torch.uint8: np.uint8,
         torch.int8: np.int8,
         torch.int32: np.int32,
         torch.int64: np.int64,
         torch.float16: np.float16,
-        torch.bfloat16: np.uint16,
-        torch.float8_e4m3fn: np.uint8,
-        torch.float8_e5m2: np.uint8,
         torch.float32: np.float32,
-    }[dt]
+    }
+    if dt in native:
+        return native[dt]
+    return {1: np.uint8, 2: np.uint16, 4: np.uint32, 8: np.uint64}[_elsize(dt)]
 
 
 def is_ftw_checkpoint(path: str) -> bool:
@@ -345,6 +346,12 @@ class FTWReader:
             m.close()
         self._maps.clear()
 
+    def file_pieces(self, name: str) -> list[tuple[str, int, int]]:
+        """``(shard_path, file_off, length)`` covering tensor ``name`` in order (split at
+        shard boundaries) — for in-place random access to a large side table."""
+        entry = self.tensors[name]
+        return [(os.path.join(self.dir, f), off, n) for f, off, _, n in self._pieces(entry["global_off"], entry["nbytes"])]
+
     def _pieces(self, global_off: int, nbytes: int):
         """Yield (file, file_off, dest_off, length) covering [global_off, +nbytes),
         split at shard boundaries. All file_off/dest_off are ALIGN-aligned."""
@@ -501,8 +508,11 @@ def _entry_windows(entries: list, window_bytes: int):
 
 def iter_ftw_weights(path: str, *, kinds=("weight",), workers: int | None = None,
                      chunk: int = _DEFAULT_CHUNK, prefetch: int = 2,
-                     window_bytes: int | None = None):
+                     window_bytes: int | None = None, skip=None):
     """Yield ``(name, host_tensor)`` for the requested kinds.
+
+    ``skip(name) -> bool`` drops entries BEFORE they are read (side tables served in place
+    from the shards, e.g. DeepSeek's ~92 GiB engram tables, must never be read into RAM).
 
     The dense shard is ~1000 small tensors; reading them one at a time leaves the NVMe at
     queue depth 1 (~0.8 GiB/s). Instead, consecutive entries are grouped into contiguous
@@ -523,7 +533,7 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), workers: int | None = None
         window_bytes = int(ENV.FTW_LOAD_WINDOW_MB.value) << 20
 
     reader = FTWReader(path)
-    entries = reader.entries(*kinds)
+    entries = [e for e in reader.entries(*kinds) if skip is None or not skip(e["name"])]
     if not entries:
         reader.close()
         return

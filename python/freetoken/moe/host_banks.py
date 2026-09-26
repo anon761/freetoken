@@ -109,7 +109,16 @@ class HostBank:
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         else:
-            self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+            # lazy: address space only, no resident pages yet. PRIVATE, not Python's default
+            # MAP_SHARED: shared anonymous memory is shmem, whose transparent hugepages are
+            # off (shmem_enabled=never) -- the workers are spawned, nothing shares the banks.
+            self._buf = mmap.mmap(-1, asize, flags=mmap.MAP_PRIVATE)
+            # 2 MiB pages where THP allows it ("madvise" mode needs the hint): the fill
+            # faults, the cudaHostRegister pin and the unpin + free at exit walk 512x fewer
+            # pages -- 4 KiB pages for ~134 GiB of banks kept every engine stop busy for over
+            # a minute. Without free hugepages the kernel stays on 4 KiB.
+            if hasattr(mmap, "MADV_HUGEPAGE"):
+                self._buf.madvise(mmap.MADV_HUGEPAGE)
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False

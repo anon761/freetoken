@@ -192,3 +192,30 @@ def test_gpu_stats_failure_never_breaks_the_line():
                      kv_used_pages=1, kv_total_pages=10, page_size=1)
     assert "gen throughput (token/s)" in logs[-1]
     assert "gpus:" not in logs[-1]
+
+
+def test_moe_stats_segment_before_gpus():
+    rep, logs, clock = _reporter(interval=1)
+    rep.moe_stats = lambda: "miss 0.42 (3.4/8.0 experts/layer/step)"
+    rep.gpu_stats = lambda: "TP=1"
+    rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=10, page_size=1)
+    assert "moe: miss 0.42 (3.4/8.0 experts/layer/step), gpus: TP=1" in logs[-1]
+
+
+def test_moe_stats_empty_or_failing_adds_nothing():
+    rep, logs, clock = _reporter(interval=1)
+    rep.moe_stats = lambda: ""
+    rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=10, page_size=1)
+    assert "moe:" not in logs[-1]
+
+    def boom():
+        raise RuntimeError("cache gone")
+
+    rep.moe_stats = boom
+    clock["t"] = 1.0
+    rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=10, page_size=1)
+    assert "gen throughput (token/s)" in logs[-1]
+    assert "moe:" not in logs[-1]

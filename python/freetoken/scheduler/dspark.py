@@ -27,7 +27,7 @@ from freetoken.engine import DSPARK_VERIFY_MODES
 from freetoken.engine.sample import probs_from_logits, sample_residual
 from freetoken.message import DetokenizeMsg
 from freetoken.utils import init_logger
-from .dspark_controller import Decision, DSparkController, DSparkFaultLatch, FaultKind
+from .dspark_controller import Decision, DSparkController, DSparkFaultLatch, FaultKind, VerifyCostModel
 
 if TYPE_CHECKING:
     from .scheduler import Scheduler
@@ -77,9 +77,12 @@ class DSparkManager:
         # per request (table row): the admission controller + the fault latch
         self._ctl: dict[int, DSparkController] = {}
         self._latch: dict[int, DSparkFaultLatch] = {}
+        self._row_owner: dict[int, int] = {}  # table row -> uid owning its controller/latch
         # table rows advanced by the last spec round (so a plain decode step can price
         # only the requests that REALLY decoded serially)
         self._spec_iter: set[int] = set()
+        # verify wall time vs token count, for the controller's throughput-optimal length
+        self.verify_cost = VerifyCostModel()
         self.stats_drafted = 0
         self.stats_accepted = 0
         self.stats_rounds = 0
@@ -125,12 +128,48 @@ class DSparkManager:
                 continue
             seg = aux[off : off + n]
             off += n
-            self.draft.seed_window(seg.unsqueeze(0), s)
+            self._claim_row(r)
+            self.draft.seed_window(seg.unsqueeze(0), s, r.table_idx)
             self._aux[r.table_idx] = seg[-1:].clone()
             self._aux_start[r.table_idx] = e - 1
 
+    # -------------------------------------------------------- decode-side hook
+    def note_decode(self, batch: Batch, pre_pos: List[int]) -> None:
+        """After a plain DECODE step: append each request's just-processed position to its
+        pending draft context (the decode aux row of its batch row), so the next draft sees
+        it. A serial step happens whenever a round was declined; without this the draft
+        would run on context that stops before those positions, with its query block one
+        position per missed step too early (the anchor already sits further ahead)."""
+        if not self.enabled or not self._aux:
+            return
+        buf = self.engine.model.get_dspark_decode_aux()
+        if buf is None:
+            return
+        win = self.draft.layers.op_list[0].attn.window_size
+        for i, (r, p) in enumerate(zip(batch.reqs, pre_pos)):
+            row = r.table_idx
+            pend = self._aux.get(row)
+            if pend is None:
+                continue
+            end = self._aux_start[row] + pend.shape[0]
+            if p == end:
+                if os.environ.get("FREETOKEN_DSPARK_DEBUG") == "1":
+                    logger.info_rank0(f"DSpark ctx row={row} pos={p} aux_norm={float(buf[i].float().norm()):.3f}")
+                pend = torch.cat([pend, buf[i : i + 1]], dim=0)
+                if pend.shape[0] > win:  # the ring keeps only the last `win` positions
+                    pend = pend[-win:]
+                self._aux[row] = pend
+                self._aux_start[row] = p + 1 - pend.shape[0]
+            elif p > end:
+                # positions never captured (should not happen): restart the context here
+                logger.warning_rank0(f"DSpark: context hole for row {row} ({end}..{p - 1}), restarting at {p}")
+                self._aux[row] = buf[i : i + 1].clone()
+                self._aux_start[row] = p
+
     # ----------------------------------------------------------- the round
     def run_round(self) -> None:
+        # rows advanced by THIS iteration's round (the plain decode skips them)
+        self._spec_iter = set()
         if not self.enabled:
             return
         if self.sched.prefill_manager.runnable:
@@ -160,7 +199,7 @@ class DSparkManager:
             start = self._aux_start[r.table_idx]
             ids = torch.tensor([anchor], dtype=torch.int64, device=self.engine.device)
             with self.engine.ctx.forward_batch(_DraftBatch()):
-                out_ids, _logits, _conf = self.draft.forward_spec(ids, aux.unsqueeze(0), start)
+                out_ids, _logits, _conf = self.draft.forward_spec(ids, aux.unsqueeze(0), start, r.table_idx)
             if _conf is not None:
                 # the admission gate reads these every cycle, not only in debug
                 self._draft_conf[r.table_idx] = _conf.detach()
@@ -170,6 +209,16 @@ class DSparkManager:
             # FREETOKEN_DSPARK_K < block_size stays consistent with the verify length.
             drafts.append([int(t) for t in out_ids[0][: self.k + 1].tolist()])
         return torch.tensor(drafts, dtype=torch.int32, device=self.engine.device)
+
+    def _claim_row(self, r: Req) -> None:
+        """A new request on this table row: the previous occupant's controller and fault
+        latch (kept when it finished through a plain decode) must not carry over its pause,
+        streak and measurements. Keyed by the request uid, so a prefix-cache hit (first
+        chunk not at 0) is recognized too."""
+        if self._row_owner.get(r.table_idx) != r.uid:
+            self._row_owner[r.table_idx] = r.uid
+            self._ctl.pop(r.table_idx, None)
+            self._latch.pop(r.table_idx, None)
 
     def _controller(self, r: Req) -> DSparkController:
         ctl = self._ctl.get(r.table_idx)
@@ -188,12 +237,13 @@ class DSparkManager:
                 continue
             self._controller(r).note_serial(wall_ms, consumed=1)
 
-    def _admit(self, reqs: List[Req], C: List[int], draft_mat: torch.Tensor):
+    def _admit(self, reqs: List[Req], C: List[int], draft_mat: torch.Tensor, draft_ms: float = 0.0):
         """Confidence admission (DwarfStar DSPARK-V41 §4): verify only the requests whose
         drafted prefix is confident enough. A declined cycle is a chosen call (it takes a
         window slot, its net is a straight loss); a request in the entry wait or a
         cooldown contributes nothing and falls through to serial."""
         keep: List[int] = []
+        lengths: List[int] = []
         for i, r in enumerate(reqs):
             latch = self._latch.get(r.table_idx)
             if latch is not None and latch.drafter_disabled():
@@ -201,22 +251,29 @@ class DSparkManager:
             ctl = self._controller(r)
             conf = self._draft_conf.get(r.table_idx)
             confs = conf[0][: self.k].tolist() if conf is not None else [1.0] * self.k
-            decision, _admitted = ctl.decide(confs)
+            decision, length = ctl.decide(confs, self.verify_cost)
+            if os.environ.get("FREETOKEN_DSPARK_DEBUG") == "1":
+                logger.info_rank0(
+                    f"DSpark decide row={r.table_idx} confs={[round(c, 3) for c in confs]} "
+                    f"serial_ms={ctl.serial_ms()} -> {decision.value} L={length} pause={ctl.cooldown}"
+                )
             if decision is Decision.ATTEMPT:
                 keep.append(i)
+                lengths.append(max(1, min(int(length), self.k)))
             elif decision is Decision.DECLINE:
-                # no drafter wall here: price the decline at one serial step (a loss)
-                ctl.note_cycle(ctl.serial_ms() or 0.0, consumed=1, verified=False)
-        if len(keep) == len(reqs):
-            return reqs, C, draft_mat, len(reqs)
+                # the drafter's share of this round is what the decline cost
+                ctl.note_decline(draft_ms / max(1, len(reqs)))
         if not keep:
-            return [], [], draft_mat[:0], 0
+            return [], [], draft_mat[:0], 0, []
+        if len(keep) == len(reqs):
+            return reqs, C, draft_mat, len(reqs), lengths
         idx = torch.tensor(keep, dtype=torch.long, device=draft_mat.device)
         return (
             [reqs[i] for i in keep],
             [C[i] for i in keep],
             draft_mat.index_select(0, idx),
             len(keep),
+            lengths,
         )
 
     def _note_drafter_fault(self, reqs: List[Req], exc: BaseException, *, undrained: bool) -> None:
@@ -418,6 +475,15 @@ class DSparkManager:
             torch.cuda.synchronize()
         _t0 = _time.perf_counter()
 
+        # Requests whose controller waits (entry wait, cooldown, reasoning span) decode
+        # serially this step: do not pay their draft. Their context keeps growing through
+        # note_decode, so the next draft still starts at the right position.
+        reqs = [r for r in reqs if self._controller(r).should_attempt()]
+        if not reqs:
+            return
+        n = len(reqs)
+        C = [r.cached_len for r in reqs]
+
         # -- 1. draft block per request (one forward_spec each; k drafts + anchor)
         try:
             draft_mat = self._draft_block(reqs, C)  # [n, k+1] int32
@@ -428,9 +494,13 @@ class DSparkManager:
 
         # 1b. confidence admission: verify only cycles the drafter is confident about;
         # declined / drafter-disabled requests fall back to the normal (serial) decode.
-        reqs, C, draft_mat, n = self._admit(reqs, C, draft_mat)
+        reqs, C, draft_mat, n, lengths = self._admit(reqs, C, draft_mat, 1e3 * (_t1 - _t0))
         if n == 0:
             return
+        # verify only as many drafts as the controllers found worth it (the longest one
+        # asked for this round; a shorter verify is cheaper per round)
+        k = max(lengths)
+        draft_mat = draft_mat[:, : k + 1]
         # these requests are advanced by the spec round, not by a plain decode step
         self._spec_iter = {r.table_idx for r in reqs}
 
@@ -465,6 +535,8 @@ class DSparkManager:
         # vLLM-style acceptance: greedy matches the target argmax, sampling uses speculative
         # rejection sampling (see _accept). The verify's own target is the reference.
         a_list, bonus_list = self._accept(reqs, logits, draft_mat, k)
+        # _accept read the logits on the host: the verify has finished by now
+        self.verify_cost.note(n * (k + 1), 1e3 * (_time.perf_counter() - _t1))
         bonus_gpu = torch.tensor(bonus_list, dtype=torch.int32, device=dev)
         if os.environ.get("FREETOKEN_DSPARK_FORCE_A0") == "1":
             # Diagnostic: publish only the target's own token at C (a plain decode). If the
@@ -554,6 +626,10 @@ class DSparkManager:
             # next draft window: aux over the accepted positions [C, C+a]
             self._aux[r.table_idx] = seg[: a + 1].clone()
             self._aux_start[r.table_idx] = C[i]
+            # price the cycle for the controller's cost window: the round's wall share
+            # against the tokens it actually committed for this request
+            committed = m + (1 if bonus_published else 0)
+            self._controller(r).note_cycle(1e3 * (_time.perf_counter() - _t0) / n, consumed=max(1, committed))
             if finished:
                 ctl = self._ctl.get(r.table_idx)
                 if ctl is not None:

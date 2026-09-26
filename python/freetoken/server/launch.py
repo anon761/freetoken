@@ -4,6 +4,7 @@ import logging
 import multiprocessing as mp
 import os
 import sys
+import traceback
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -120,6 +121,16 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
                 print()  # for a clean newline after ^C
                 logger.info("Scheduler exiting gracefully...")
             scheduler.shutdown()
+        except Exception:  # noqa: BLE001 -- any crash: report, then die hard (see below)
+            # A crash mid-serve (an OOM inside a forward, …) must end THIS process now.
+            # The normal interpreter teardown destroys the NCCL communicator, and
+            # ncclCommDestroy blocks forever while the peer rank still sits in a
+            # collective: the process never exits, the supervisor never sees a death,
+            # the engine keeps reporting "serving" and every request hangs.
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
 
 
 def launch_server(

@@ -12,7 +12,7 @@ from freetoken.checkpoint.ftw import _elsize, _np_dtype
 
 @pytest.mark.parametrize("dt", [
     torch.uint8, torch.int8, torch.int32, torch.int64, torch.float16, torch.bfloat16,
-    torch.float8_e4m3fn, torch.float8_e5m2, torch.float32,
+    torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e8m0fnu, torch.float32,
 ])
 def test_bank_dtypes_have_a_same_width_numpy_view(dt):
     assert np.dtype(_np_dtype(dt)).itemsize == _elsize(dt)

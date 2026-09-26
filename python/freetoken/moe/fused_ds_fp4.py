@@ -118,9 +118,8 @@ def routed_experts_fp4(
     bf16 decode kernel is bit-identical to the reference's dequantized FP8 activation
     (validated max diff = 0 vs the tilelang ``fp4_gemm`` reference)."""
     T, top_k = slots.shape
-    H = x.shape[1]
     two_I = gate_up_packed.shape[1]
-    I = two_I // 2
+    inter = two_I // 2
 
     x = act_quant_fp8_roundtrip(x, 128)  # gate_up activation -> FP8 round-trip (no clone)
     gate_up = _grouped_decode(
@@ -129,7 +128,7 @@ def routed_experts_fp4(
     )  # [T, top_k, 2I]
     act = fused_swiglu(gate_up, swiglu_limit)  # [T, top_k, I]
 
-    act = act.reshape(T * top_k, I)
+    act = act.reshape(T * top_k, inter)
     act_quant_fp8_inplace(act, 128)  # down activation -> FP8 round-trip
     down = _grouped_decode(
         act, down_packed, down_scale, slots, topk_weights,
@@ -211,7 +210,7 @@ def routed_experts_fp4_prefill(
         )
     H = x.shape[1]
     two_I = gate_up_packed.shape[1]
-    I = two_I // 2
+    inter = two_I // 2
     routes = T * top_k
     # One static config for every density (no autotune): the kernel is
     # dequant-floor-bound, so per-expert padding at BLOCK_M=64 costs the same
@@ -230,8 +229,12 @@ def routed_experts_fp4_prefill(
         sorted_ids, expert_ids, ntpp, routes, top_k, False, cfg,
     )
     act = fused_swiglu(gate_up, swiglu_limit)  # [T, top_k, I]
+    # gate_up is dead from here on; freeing it before ``down`` is allocated keeps the
+    # prefill peak at act+down instead of gate_up+act+down (~230 MB less at a
+    # 9k-token chunk — the margin a large chunk next to a big expert cache OOMed on).
+    del gate_up
 
-    act = act.reshape(routes, I)
+    act = act.reshape(routes, inter)
     act_quant_fp8_inplace(act, 128)  # down activation -> FP8 round-trip
     down = torch.empty((T, top_k, H), dtype=x.dtype, device=x.device)
     _grouped_prefill(

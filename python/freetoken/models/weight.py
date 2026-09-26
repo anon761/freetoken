@@ -323,11 +323,17 @@ def _load_weight_inner(
         except AttributeError:
             _shard_fn = None
         _tp = get_tp_info()
-        for name, tensor in iter_ftw_weights(model_path):
+
+        def skip(name: str) -> bool:
+            # Filtered before the read: engram tables (--include-engram, ~92 GiB each) are
+            # served in place from the shards by the engram row source, never loaded.
+            if ".engram.embed." in name:
+                return True
             if skip_vision and name.startswith(VISION_KEY_PREFIXES):
-                continue
-            if not mtp_on and name.startswith(("mtp.", "model.mtp.")):
-                continue
+                return True
+            return not mtp_on and name.startswith(("mtp.", "model.mtp."))
+
+        for name, tensor in iter_ftw_weights(model_path, skip=skip):
             if _shard_fn is not None and _tp.size > 1:
                 tensor = _shard_fn(name, tensor, model_path, _tp)
             yield name, tensor

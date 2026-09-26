@@ -59,6 +59,10 @@ _SHUTTING_DOWN = threading.Event()
 BACKEND_DEATH_EXIT_GRACE_S = 10.0
 
 
+class BackendGoneError(RuntimeError):
+    """The backend died while a request waited for its output: no more acks will arrive."""
+
+
 def get_global_state() -> FrontendManager:
     global _GLOBAL_STATE
     assert _GLOBAL_STATE is not None, "Global state is not initialized"
@@ -312,6 +316,26 @@ class FrontendManager:
             # Loop already closed (shutdown racing the crash): nothing left to wake.
             pass
 
+    def fail_pending_requests(self, message: str) -> None:
+        """Wake every request waiting for output after a worker death latched a fatal error:
+        its acks will never arrive, and a parked handler keeps its HTTP connection open, which
+        also stalls uvicorn's graceful shutdown ("Waiting for connections to close") forever.
+        wait_for_ack then raises BackendGoneError — a 500 for a plain request, a cut stream for
+        SSE. Marshalled onto the loop like fail_pending_rebuilds (asyncio.Event is not
+        thread-safe)."""
+        loop = self._loop
+        if loop is None:
+            return  # listener never started -> no request can be waiting
+
+        def _wake_all() -> None:
+            for event in list(self.event_map.values()):
+                event.set()
+
+        try:
+            loop.call_soon_threadsafe(_wake_all)
+        except RuntimeError:
+            pass  # loop already closed (shutdown racing the crash): nothing left to wake
+
     def _create_listener_once(self):
         if not self.initialized:
             self._loop = asyncio.get_running_loop()
@@ -334,6 +358,8 @@ class FrontendManager:
                 event.clear()
 
                 pending = self.ack_map[uid]
+                if not pending and self.fatal_error is not None:
+                    raise BackendGoneError(self.fatal_error)
                 self.ack_map[uid] = []
                 ack = None
                 for ack in pending:
@@ -1001,6 +1027,8 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         # No CacheRebuildReply will ever arrive from a dead backend, so wake any caller blocked
         # in dispatch_rebuild's await now — otherwise it strands until the full rebuild timeout.
         _GLOBAL_STATE.fail_pending_rebuilds(message)
+        # Likewise for requests parked on their output (see fail_pending_requests).
+        _GLOBAL_STATE.fail_pending_requests(message)
         # Then take the whole serve down (see _exit_after_backend_death). Shell mode is excluded:
         # a person is sitting at that TUI, the API is theirs alone, and its stop path is ^C.
         if not run_shell:

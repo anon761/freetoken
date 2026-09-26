@@ -70,3 +70,57 @@ def test_factory_selects_backend(tmp_path, monkeypatch):
     assert isinstance(make_engram_row_source(str(tmp_path), 1, PREFIX), RamEngramRowSource)
     monkeypatch.setenv("FREETOKEN_ENGRAM_BACKEND", "disk")
     assert type(make_engram_row_source(str(tmp_path), 1, PREFIX)) is EngramRowSource
+
+
+def _write_ftw(tmp_path, rows: int = 96):
+    """An FTW converted with --include-engram: the tables under their ``model.`` names,
+    with a tiny shard limit so the value table spans several shards (like the real
+    ~92 GiB tables across 8 GiB shards)."""
+    from freetoken.checkpoint.ftw import FTWWriter
+
+    w = torch.randint(1, 255, (rows, _ROW_BYTES), dtype=torch.uint8)
+    s = torch.randint(1, 255, (rows, _SCALE_BYTES), dtype=torch.uint8)
+    out = tmp_path / "Model-FTW"
+    wr = FTWWriter(str(out), shard_limit=8192)
+    wr.add_tensor("model.layers.0.attn.norm.weight", torch.zeros(4096, dtype=torch.uint8))
+    wr.add_tensor(f"model.{PREFIX}.embed.scale", s)
+    wr.add_tensor(f"model.{PREFIX}.embed.weight", w)
+    wr.finalize({})
+    return str(out), w, s
+
+
+def test_ftw_tables_span_shards_and_match_both_backends(tmp_path):
+    path, w, s = _write_ftw(tmp_path)
+    from freetoken.checkpoint.ftw import FTWReader
+
+    assert len(FTWReader(path).file_pieces(f"model.{PREFIX}.embed.weight")) > 1
+    idx = torch.tensor([0, 31, 32, 33, 95, 64, 0], dtype=torch.int64)
+    for source in (EngramRowSource(path, 1, PREFIX), RamEngramRowSource(path, 1, PREFIX)):
+        out = torch.zeros(idx.numel(), _ROW_BYTES + _SCALE_BYTES, dtype=torch.uint8)
+        source.read_rows(idx, out)
+        assert source.rows == w.shape[0]
+        assert torch.equal(out[:, :_ROW_BYTES], w[idx])
+        assert torch.equal(out[:, _ROW_BYTES:], s[idx])
+
+
+def test_ftw_without_tables_needs_the_raw_checkpoint(tmp_path):
+    from freetoken.checkpoint.ftw import FTWWriter
+
+    out = tmp_path / "Other-FTW"
+    wr = FTWWriter(str(out), shard_limit=8192)
+    wr.add_tensor("model.layers.0.attn.norm.weight", torch.zeros(16, dtype=torch.uint8))
+    wr.finalize({})
+    try:
+        EngramRowSource(str(out), 1, PREFIX)
+    except FileNotFoundError as e:
+        assert "--include-engram" in str(e)
+    else:
+        raise AssertionError("an FTW without tables and without a raw checkpoint must fail clearly")
+
+
+def test_ftw_dense_load_skips_the_tables_before_reading(tmp_path):
+    from freetoken.checkpoint.ftw import iter_ftw_weights
+
+    path, _, _ = _write_ftw(tmp_path)
+    names = [n for n, _ in iter_ftw_weights(path, skip=lambda n: ".engram.embed." in n)]
+    assert names == ["model.layers.0.attn.norm.weight"]

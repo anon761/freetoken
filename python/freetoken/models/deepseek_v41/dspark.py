@@ -134,24 +134,25 @@ class DSparkAttention(BaseOP):
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)
         return self.wo_b.forward(o)
 
-    def _write_window(self, main_kv: torch.Tensor, start_pos: int, seqlen: int) -> None:
+    def _write_window(self, main_kv: torch.Tensor, start_pos: int, seqlen: int, row: int) -> None:
         """Write the last ``min(seqlen, win)`` target-aux KV of [start_pos, start_pos+seqlen)
-        into the ring at their absolute ring slots."""
+        into the ring rows ``[row, row+bsz)`` at their absolute ring slots. A row is a
+        request's own ring (its table row): concurrent requests must not share one."""
         win = self.window_size
         bsz = main_kv.size(0)
         keep = min(seqlen, win)
         seg = main_kv[:, seqlen - keep :]
         base = start_pos + seqlen - keep
         slots = (base + torch.arange(keep, device=main_kv.device)) % win
-        self.window_kv_cache[:bsz, slots] = seg
+        self.window_kv_cache[row : row + bsz, slots] = seg
 
-    def seed_window(self, main_x: torch.Tensor, start_pos: int) -> None:
+    def seed_window(self, main_x: torch.Tensor, start_pos: int, row: int = 0) -> None:
         """Target-aux window seed for a prompt/extend, without running the draft block."""
         seqlen = main_x.size(1)
         kv = self._kv(main_x, self._freqs_cis[start_pos : start_pos + seqlen])
-        self._write_window(kv, start_pos, seqlen)
+        self._write_window(kv, start_pos, seqlen, row)
 
-    def forward(self, x: torch.Tensor, start_pos: int, main_x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, start_pos: int, main_x: torch.Tensor, row: int = 0) -> torch.Tensor:
         from freetoken.kernel.triton.dsv4.sparse_attn import sparse_attn_paged
 
         rd = self.rope_head_dim
@@ -162,7 +163,7 @@ class DSparkAttention(BaseOP):
         main_kv = self._kv(main_x, self._freqs_cis[start_pos : start_pos + seqlen])
         if start_pos == 0:
             # Prefill only seeds the window KV ring (the draft is not run over the prompt).
-            self._write_window(main_kv, start_pos, seqlen)
+            self._write_window(main_kv, start_pos, seqlen, row)
             return x
 
         block = x.size(1)
@@ -174,7 +175,7 @@ class DSparkAttention(BaseOP):
         # Write this forward's target-aux KV for positions [start_pos, start_pos+seqlen)
         # into the ring. The reference toy loop feeds one position per forward; the spec
         # loop feeds the accepted window of the last verify, so seqlen may be > 1.
-        self._write_window(main_kv, start_pos, seqlen)
+        self._write_window(main_kv, start_pos, seqlen, row)
 
         w = min(win, start_pos + seqlen)
         win_half = torch.full((bsz, block, win), -1, dtype=torch.int32, device=device)
@@ -188,7 +189,7 @@ class DSparkAttention(BaseOP):
         ).expand(bsz, block, block).to(torch.int32)
         topk = torch.cat([win_half, cmp_half], dim=-1)
 
-        window_pool = self.window_kv_cache[:bsz].reshape(bsz * win, self.head_dim)
+        window_pool = self.window_kv_cache[row : row + bsz].reshape(bsz * win, self.head_dim)
         cmp_pool = kv.reshape(bsz * block, self.head_dim)
         o = sparse_attn_paged(
             q, window_pool, cmp_pool, self.attn_sink[self._sink_slice],
@@ -241,23 +242,23 @@ class DSparkBlock(BaseOP):
     def bind(self, device: torch.device, max_batch: int) -> None:
         self.attn.bind(device, max_batch)
 
-    def seed_window(self, main_x: torch.Tensor, start_pos: int) -> None:
-        self.attn.seed_window(main_x, start_pos)
+    def seed_window(self, main_x: torch.Tensor, start_pos: int, row: int = 0) -> None:
+        self.attn.seed_window(main_x, start_pos, row)
 
     def _split(self, R, hc_fn, hc_scale, hc_base):
         return hc_split(hc_mixes(R, hc_fn, self.norm_eps), hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
 
-    def forward(self, R, start_pos, pre_mix, main_x):
+    def forward(self, R, start_pos, pre_mix, main_x, row: int = 0):
         if start_pos == 0:
             # Prefill only seeds this stage's window KV (reference DSparkBlock.forward).
-            self.attn.seed_window(main_x, start_pos)
+            self.attn.seed_window(main_x, start_pos, row)
             return R, pre_mix
         # Port convention: R is [M, hc, dim] (M = b*block flat tokens), pre_mix [M, hc].
         pre_a, post_a, comb_a = self._split(R, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = hc_collapse(R, pre_mix, R.dtype) if pre_mix is not None else R[:, 0]
         x = self.attn_norm.forward(x)
         b = main_x.size(0)
-        x = self.attn.forward(x.view(b, self.block_size, -1), start_pos, main_x)
+        x = self.attn.forward(x.view(b, self.block_size, -1), start_pos, main_x, row)
         R = hc_add(x.reshape(-1, R.shape[-1]), R, post_a, comb_a)
 
         pre_f, post_f, comb_f = self._split(R, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
@@ -374,13 +375,13 @@ class DSparkDraft(BaseOP):
         self.bind_offload_cache(cache)
         return cache
 
-    def seed_window(self, main_hidden: torch.Tensor, start_pos: int) -> None:
-        """Seed every stage's window ring from the target aux hidden over a prompt/extend,
-        without running a draft block (the prefill hook)."""
+    def seed_window(self, main_hidden: torch.Tensor, start_pos: int, row: int = 0) -> None:
+        """Seed every stage's window ring (row ``row``) from the target aux hidden over a
+        prompt/extend or serially decoded positions, without running a draft block."""
         first = self.layers.op_list[0]
         main_x = first.main_norm.forward(first.main_proj.forward(main_hidden))
         for layer in self.layers.op_list:
-            layer.seed_window(main_x, start_pos)
+            layer.seed_window(main_x, start_pos, row)
 
     def forward_embed(self, main_hidden: torch.Tensor, input_ids: torch.Tensor):
         """``main_hidden``: target aux hidden ``[b, seqlen, dim*len(target_layers)]`` (the
@@ -400,11 +401,11 @@ class DSparkDraft(BaseOP):
         R = x.reshape(-1, 1, x.shape[-1]).expand(-1, self.hc_mult, -1).contiguous()
         return R, main_x
 
-    def forward_spec(self, input_ids: torch.Tensor, main_hidden: torch.Tensor, start_pos: int = 0):
+    def forward_spec(self, input_ids: torch.Tensor, main_hidden: torch.Tensor, start_pos: int = 0, row: int = 0):
         h, main_x = self.forward_embed(main_hidden, input_ids)
         pre_mix = None
         for layer in self.layers.op_list:
-            h, pre_mix = layer.forward(h, start_pos, pre_mix, main_x)
+            h, pre_mix = layer.forward(h, start_pos, pre_mix, main_x, row)
         if start_pos == 0:
             return None
         return self.forward_head(h, pre_mix, input_ids)

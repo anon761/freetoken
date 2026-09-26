@@ -327,3 +327,37 @@ def test_cache_rebuild_request_rejects_unknown_mode():
     assert CacheRebuildRequest(mode="if_idle").mode == "if_idle"
     with pytest.raises(ValidationError):
         CacheRebuildRequest(mode="drain")
+
+
+def test_backend_death_wakes_requests_parked_on_their_output():
+    """A request waiting for output when the scheduler dies must not park forever: its acks
+    never arrive, and the open connection would also stall uvicorn's graceful shutdown.
+    fail_pending_requests (called off-thread by the supervisor) wakes it with BackendGoneError."""
+    import pytest
+
+    from freetoken.server.api_server import BackendGoneError
+
+    async def _run():
+        state = SimpleNamespace(
+            _loop=asyncio.get_running_loop(), event_map={7: asyncio.Event()},
+            ack_map={7: []}, fatal_error=None,
+        )
+
+        async def consume():
+            async for _ack in FrontendManager.wait_for_ack(state, 7):
+                pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0.01)
+        assert not task.done()  # parked on its output
+
+        def crash():  # the supervisor thread's _on_failure
+            state.fatal_error = "backend worker freetoken-TP0-scheduler exited"
+            FrontendManager.fail_pending_requests(state, state.fatal_error)
+
+        threading.Thread(target=crash).start()
+        with pytest.raises(BackendGoneError, match="scheduler exited"):
+            await asyncio.wait_for(task, timeout=5.0)
+        assert 7 not in state.event_map and 7 not in state.ack_map  # cleaned up
+
+    asyncio.run(_run())

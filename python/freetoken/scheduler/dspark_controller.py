@@ -12,12 +12,12 @@ to verify a cycle the drafter is not confident about — not chasing acceptance.
 
 Two independent pieces:
 
-* :class:`DSparkController` — per request. The confidence gate (admit a cycle
-  only when the drafted prefix is confident enough) is the part wired into the
-  scheduler today; the windowed cost feedback (price a cycle from the measured
-  serial step, back off for a bounded number of tokens) is complete and unit
-  tested, and activates when the caller feeds it serial step timings. It never
-  latches off, matching DwarfStar.
+* :class:`DSparkController` — per request. Each cycle it verifies the draft length
+  with the best expected committed tokens per ms (calibrated confidences against a
+  verify cost model and the measured serial step), or declines. Unproductive probing
+  is throttled: after a decline or a losing cycle the drafter pauses for 1, 2, 4 ... 16
+  serial steps (the pause resets on the first winning cycle), so prose pays a draft
+  only now and then while predictable spans draft every step. It never latches off.
 * :class:`DSparkFaultLatch` — per request. A recoverable ("drained") drafter
   failure before the target verify falls back to serial and skips the drafter for
   the rest of the request; an unrecoverable ("undrained") failure after the
@@ -32,13 +32,12 @@ import statistics
 from collections import deque
 from enum import Enum
 
-DEFAULT_P_MIN = 0.75          # per-position confidence floor (DwarfStar's GLM value)
-DEFAULT_MIN_DRAFT = 3         # admitted prefix below this declines the cycle
-DEFAULT_ENTRY_WAIT = 16       # consumed serial tokens before the first attempt
-WINDOW_ATTEMPTS = 3           # a cost window is three complete attempts
+DEFAULT_P_MIN = 0.75          # confidence floor of the fallback prefix rule (no cost model)
+DEFAULT_MIN_DRAFT = 3         # fallback: admitted prefix below this declines the cycle
+DEFAULT_ENTRY_WAIT = 2        # serial steps measured before the first draft (prices them)
 SERIAL_MEDIAN_N = 9           # serial cost is the median of the last N measured steps
-BACKOFF_BASE = 16             # consumed-token cooldown ladder: 16, 32, 64, 128
-BAD_RUN_CAP = 4
+MAX_PAUSE = 16                # drafter pause after unproductive cycles: 1, 2, 4, 8, 16 steps
+GAIN_MARGIN = 0.05            # a verify must beat serial by this much in expected tokens/ms
 
 
 class Decision(str, Enum):
@@ -97,17 +96,13 @@ class DSparkController:
         """Open a fresh request ledger (DwarfStar: the ledger is request-local)."""
         self.reasoning = reasoning
         self.consumed = 0                    # consumed serial tokens this request
-        self.cooldown = 0                    # remaining consumed-token cooldown
-        self.bad_run = 0
+        self.cooldown = 0                    # serial steps left before the next draft
+        self.streak = 0                      # consecutive unproductive cycles
         self._serial: deque[float] = deque(maxlen=SERIAL_MEDIAN_N)
-        self._win_net = 0.0
-        self._win_attempts = 0
         # counters
         self.attempts = 0
         self.declines = 0
         self.losing_cycles = 0
-        self.windows = 0
-        self.backoffs = 0
         self.committed = 0
         self.serial_rows = 0
         self.cycle_ms = 0.0
@@ -153,51 +148,73 @@ class DSparkController:
             return False                      # still backing off
         return True
 
-    def decide(self, confidences) -> tuple[Decision, int]:
-        """Return ``(Decision, admitted_prefix)`` for the coming cycle."""
+    def best_length(self, confidences, serial_ms: float, verify_ms) -> int:
+        """Draft length to verify: the one maximizing the expected committed tokens per ms,
+        0 when a serial step is expected to be faster.
+
+        With calibrated per-position confidences p_i, verifying the first L drafts commits
+        ``1 + sum_{j<=L} prod_{i<=j} p_i`` tokens (the anchor's bonus plus the expected
+        accepted run) at ``verify_ms(L + 1)``; a serial step commits one token at
+        ``serial_ms``. The drafter's own cost is already spent when this is asked."""
+        best, best_rate = 0, (1.0 + GAIN_MARGIN) / serial_ms
+        expected, run = 0.0, 1.0
+        for length, c in enumerate(confidences, start=1):
+            run *= float(c)
+            expected += run
+            rate = (1.0 + expected) / verify_ms(length + 1)
+            if rate > best_rate:
+                best, best_rate = length, rate
+        return best
+
+    def decide(self, confidences, verify_ms=None) -> tuple[Decision, int]:
+        """Return ``(Decision, draft length)`` for the coming cycle.
+
+        With ``verify_ms`` (a verify cost model, ms for ``t`` tokens) and a measured
+        serial step, the length is the throughput-optimal one (:meth:`best_length`);
+        otherwise the confidence-floor prefix of DwarfStar's controller."""
         if not self.adaptive:
             return Decision.ATTEMPT, self.block   # propose everywhere (fixed-block arm)
         if not self.should_attempt():
             return Decision.SERIAL, 0
+        serial = self.serial_ms()
+        if verify_ms is not None and serial:
+            length = self.best_length(confidences, serial, lambda t: verify_ms(t, serial))
+            return (Decision.ATTEMPT, length) if length > 0 else (Decision.DECLINE, 0)
         admitted = self.admitted_prefix(confidences)
         if admitted < self.min_draft:
             return Decision.DECLINE, admitted
         return Decision.ATTEMPT, admitted
 
     # --------------------------------------------------------------- feedback
-    def note_cycle(self, wall_ms: float, consumed: int, verified: bool) -> None:
-        """Price one cycle. ``verified`` = the target was asked to check something.
+    def _pause(self) -> None:
+        """One more unproductive cycle: pause the drafter for 1, 2, 4 ... MAX_PAUSE steps."""
+        self.streak += 1
+        self.cooldown = min(MAX_PAUSE, 1 << (self.streak - 1))
 
-        A decline is a chosen call: it takes a window slot and its net is a
-        straight loss of the drafter cost (DwarfStar: getting this asymmetry wrong
-        made prose run at 0.816x serial because nothing throttled probing)."""
+    def note_decline(self, draft_ms: float) -> None:
+        """A drafted cycle the target was not asked to verify: its drafter cost is lost."""
+        self.declines += 1
+        self.cycle_ms += draft_ms
+        self.net_ms += draft_ms
+        self._pause()
+
+    def note_cycle(self, wall_ms: float, consumed: int) -> None:
+        """A verified cycle (draft + verify ``wall_ms``) that committed ``consumed`` tokens,
+        priced against as many serial steps: a win clears the pause, a loss extends it."""
+        self.attempts += 1
+        self.committed += consumed
         self.cycle_ms += wall_ms
         serial = self.serial_ms()
-        if verified:
-            self.attempts += 1
-            self.committed += consumed
-            if serial is not None and wall_ms - consumed * serial > 0.0:
-                self.losing_cycles += 1
-        else:
-            self.declines += 1
         if serial is None:
             return
         net = wall_ms - consumed * serial
         self.net_ms += net
-        self._win_net += net
-        self._win_attempts += 1
-        if self._win_attempts < WINDOW_ATTEMPTS:
-            return
-        self.windows += 1
-        if self._win_net < 0.0:
-            self.bad_run = 0
+        if net < 0.0:
+            self.streak = 0
             self.cooldown = 0
         else:
-            self.bad_run = min(self.bad_run + 1, BAD_RUN_CAP)
-            self.cooldown = BACKOFF_BASE << (self.bad_run - 1)
-            self.backoffs += 1
-        self._win_net = 0.0
-        self._win_attempts = 0
+            self.losing_cycles += 1
+            self._pause()
 
     # --------------------------------------------------------------- lifecycle
     def enter_reasoning(self) -> None:
@@ -209,26 +226,46 @@ class DSparkController:
             self.cooldown = 0  # evidence inside a reasoning span does not price what follows
 
     def note_prefix_reset(self) -> None:
-        """The prefix stopped being an extension of what it was: drop measured
-        evidence (serial window + open window). The cooldown survives — it is
-        request policy, not measured evidence."""
+        """The prefix stopped being an extension of what it was: drop the measured serial
+        steps. The pause survives — it is request policy, not measured evidence."""
         self._serial.clear()
-        self._win_net = 0.0
-        self._win_attempts = 0
 
     def telemetry(self) -> dict:
         return {
             "dspark_attempts": self.attempts,
             "dspark_declines": self.declines,
             "dspark_losing_cycles": self.losing_cycles,
-            "dspark_windows": self.windows,
-            "dspark_backoffs": self.backoffs,
             "dspark_committed": self.committed,
             "dspark_serial_rows": self.serial_rows,
             "dspark_cycle_ms": round(self.cycle_ms, 3),
             "dspark_net_ms": round(self.net_ms, 3),
             "dspark_cooldown": self.cooldown,
         }
+
+
+class VerifyCostModel:
+    """Verify wall time as a function of its token count (anchor + drafts), shared by all
+    requests (it is a property of the hardware and the model). A least-squares line over
+    the recent measurements once two different lengths were seen; before that a prior
+    relative to the serial step, ``serial * (1 + 0.5 * t)`` (measured on 2x3090 offload:
+    a verify costs ~76 + 36 t ms against a 73 ms serial step)."""
+
+    def __init__(self, window: int = 64) -> None:
+        self._obs: deque[tuple[int, float]] = deque(maxlen=window)
+
+    def note(self, tokens: int, wall_ms: float) -> None:
+        self._obs.append((int(tokens), float(wall_ms)))
+
+    def __call__(self, tokens: int, serial_ms: float) -> float:
+        ts = [t for t, _ in self._obs]
+        if len(set(ts)) < 2:
+            return serial_ms * (1.0 + 0.5 * tokens)
+        n = len(self._obs)
+        mt = sum(ts) / n
+        mv = sum(v for _, v in self._obs) / n
+        var = sum((t - mt) ** 2 for t in ts)
+        slope = max(0.0, sum((t - mt) * (v - mv) for t, v in self._obs) / var)
+        return max(1e-3, mv + slope * (tokens - mt))
 
 
 class FaultKind(str, Enum):
