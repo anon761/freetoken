@@ -36,14 +36,15 @@ and a reworked **quantization layer**, while keeping the upstream runtime intact
 
 | Area | Additions on top of upstream |
 |---|---|
-| **New model family** | DeepSeek-V4.1-Flash (`dsv41`): mHC residual streams, CSA2 sparse attention, Lightning Indexer, Engram n-gram memory, DSpark draft |
+| **New model family** | DeepSeek-V4.1-Flash (`dsv41`): mHC residual streams, CSA2 sparse attention, Lightning Indexer, Engram n-gram memory, DSpark draft; tuned for 2× 24 GB offload |
 | **Vision** | Qwen3.8-Flash-Next vision tower + online image input (`image_url`), selectable PLE table dtype (bf16/fp8) |
-| **Speculative decoding** | MTP draft head (embedded or external artifact), rejection sampling, commit-prefix, round chaining, n-gram combiner, verify CUDA graph |
+| **Speculative decoding** | MTP draft head (embedded, external or standalone INT4), rejection sampling, commit-prefix, CUDA-graphed draft/verify, overlap scheduling, round chaining; DSpark with a cost-aware verify length |
 | **FTW fast weights** | TP-slicing, side-table carry (PLE/Engram), selectable MTP head, `--include-engram` / `--include-dspark`, naive-fp8 dequant |
 | **Tensor parallelism** | TP-sharded loading for `qwen4_exp` / `qwen3_5_moe` / `glm5_next`, per-rank expert banks, optional fp8 all-reduce |
-| **Quantization** | config/scheme/method dialect layer, mixed-precision expert detection, compressed-tensors fp8/nvfp4 |
-| **Server / CLI** | per-GPU memory ratio, env-backed knobs as CLI flags, `--swa-eviction-interval`, GPU telemetry |
-| **Stability** | FTW TP band offsets, O_DIRECT band reads, scheduler spec budget, Engram hashing, reasoning/DSML parsers |
+| **Quantization** | config/scheme/method dialect layer, mixed-precision expert detection, compressed-tensors fp8/nvfp4, AutoRound W4A16 experts, `--dense-fp8` |
+| **Server / CLI** | per-GPU memory ratio, env-backed knobs as CLI flags, `--swa-eviction-interval`, `--force-greedy`, `--moe-collect-stats`, GPU telemetry |
+| **Performance** | split-K small-M fp8/NVFP4/WNA16 decode GEMMs, one TP all-reduce per MoE layer, expert banks on transparent hugepages |
+| **Stability** | FTW TP band offsets, O_DIRECT band reads, scheduler spec budget, Engram hashing, reasoning/DSML parsers, a dead backend fails requests instead of hanging them |
 
 ---
 
@@ -59,7 +60,21 @@ the engine:
   on disk (or RAM via `--engram-backend {disk,ram}`), with a compressed-vocabulary hash (`Phase 4`).
 - **DSpark draft** — non-causal block-attention backbone with Markov + confidence heads, an
   admission controller and a fault latch, vLLM-style rejection-sampling acceptance, and
-  `--dspark-verify {decode,prefill}`.
+  `--dspark-verify {decode,prefill}`. The draft context follows every processed position
+  (serial decode steps included), and the controller verifies the draft length that maximizes
+  expected tokens per verify cost (a fitted verify-cost model), backing off with a doubling
+  pause when drafting does not pay.
+- **FTW** — `ft checkpoint --include-engram` carries the Engram tables into the FTW; the server
+  reads them from there.
+
+**Offload tuning** (2× 24 GB consumer GPUs, experts and Engram in host RAM / on NVMe):
+
+- Engram scales stay resident in RAM, only the 256-byte value rows are read from disk, with
+  parallel reads and a prefetch of every layer's prefill rows at the top of the forward.
+- The mHC mixes and the Indexer's prefill selection run in slices, so long prompts no longer
+  hit fp32 transient OOMs; the fp4 MoE prefill frees `gate_up` before `down`.
+- Host expert banks live in private anonymous memory with transparent hugepages.
+- `--moe-collect-stats` adds the decode expert-cache miss rate to the status line.
 
 ```bash
 ft serve --model-path <DeepSeek-V4.1-Flash> \
@@ -80,18 +95,24 @@ Qwen3.8-Flash-Next (`qwen4_exp`) gains a full **vision tower** and **online imag
   via `input_modalities` in `/v1/models`.
 - **Selectable PLE table dtype** — `ft checkpoint --ple {auto,fp8,bf16}` (default `bf16`), served
   as a bf16 or fp8 bank (pinned-host or disk backend).
+- Correct compressed-tensors NVFP4 expert global scales, and NVFP4 `gate_up` TP bands.
 
 ---
 
 ## Speculative decoding (MTP + DSpark)
 
-- **MTP draft head** for Qwen3.8-Flash-Next and Qwen3.5/3.6 MoE: eager speculative decode rounds,
-  a standalone draft-head loader (`--mtp-path`), `--mtp {auto,on,off,file}` + `--mtp-header`,
-  rejection sampling for sampled requests, and commit-the-accepted-prefix (no full re-extend).
-- **Performance levers**: one verify CUDA graph per padded batch size plus a draft-chain CUDA
-  graph, overlap scheduling (the verify is the overlapped batch), pinned FLA tensor caches,
-  layer-invariant tensors hoisted out of the per-layer loop, opt-in round chaining
-  (`FREETOKEN_MTP_CHAIN`) and a self-history n-gram draft combiner (`FREETOKEN_MTP_NGRAM`).
+- **MTP draft head** for Qwen3.8-Flash-Next and Qwen3.5/3.6 MoE: speculative decode rounds,
+  a standalone draft-head loader (`--mtp-path`, including a compressed-tensors INT4-g32 head),
+  `--mtp {auto,on,off,file}` + `--mtp-header`, rejection sampling for sampled requests
+  (`--mtp-sampled`), and commit-the-accepted-prefix (no full re-extend).
+- **Round overhaul** — a speculative round costs less than a decode step: decode-exact GDN verify
+  with a one-call commit, CUDA-graphed draft, verify and commit with a per-round split-KV
+  re-plan, overlap scheduling (the verify is the overlapped batch), per-rank draft argmax.
+  Qwen3.8-27B with MTP went from 53 to 88 tok/s at 1k context and from 29 to 88 at 14k.
+- Round chaining is on by default (`--no-mtp-chain`), plus a frequency-adapted draft vocabulary
+  (`--mtp-draft-vocab`), an fp8 draft head (`--mtp-head-fp8`) and a self-history n-gram draft
+  combiner (`FREETOKEN_MTP_NGRAM`).
+- **DSpark** (DeepSeek-V4.1) — see above.
 - `--moe-verify-cpu` runs the verify experts on the CPU executor.
 
 ---
@@ -126,12 +147,22 @@ The self-contained FTW checkpoint (fast load) gained:
   `detect_expert_quant` and per-family roles derive from it.
 - **Mixed-precision** detection for compressed-tensors and ModelOpt exports; a shared block-fp8
   expert reader; correct handling of `naive-quantized` dense groups (dequantized to bf16).
+- **AutoRound W4A16** (INT4, group 128) routed experts with a fused Triton decode + prefill kernel
+  and an FTW band layout.
+- **`--dense-fp8`** quantizes the bf16 dense linears to per-row fp8 (W8A16) at load —
+  Qwen3.8-Flash-Next plain decode NVFP4 57 → 71 and W4A16 53 → 70 tok/s at 1k context.
+- Split-K small-M GEMMs for batched decode and speculative verify (fp8 W8A16, NVFP4 tail wave,
+  WNA16 narrow tiles with deterministic split-K).
 
 ---
 
 ## Server / CLI
 
 - Env-backed runtime knobs exposed as CLI flags; `--swa-eviction-interval`.
+- `--force-greedy` serves every request greedily; `--moe-collect-stats` shows the decode
+  expert-cache miss rate.
+- A backend that dies mid-serve fails its pending requests (500 / cut stream) instead of leaving
+  connections hanging, and a crashed scheduler worker exits instead of blocking in NCCL teardown.
 - Anthropic/OpenAI-compatible APIs, DSML/reasoning parsers that respect always-think templates.
 
 ---
@@ -143,7 +174,7 @@ In addition to the upstream set, this fork serves:
 | Model | Notes |
 |---|---|
 | DeepSeek-V4.1-Flash | new family (mHC, CSA2, Lightning Indexer, Engram, DSpark) |
-| Qwen3.8-Flash-Next | + vision tower, online images, selectable PLE dtype |
+| Qwen3.8-Flash-Next | + vision tower, online images, selectable PLE dtype, AutoRound W4A16 experts, standalone INT4 MTP head |
 | Qwen3.5 / 3.6 MoE | + dense MTP draft, compressed-tensors FP8 + NVFP4 hybrid, TP |
 | GLM-5.3-Flash / GLM-5.2 | quantization roles via the dialect layer |
 
