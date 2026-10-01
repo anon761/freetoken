@@ -29,6 +29,24 @@ def _expert_bank(S, N, K, dev):
     return qw, qz, scales, w.transpose(1, 2)  # dequant [S, N, K]
 
 
+def test_wna16_kernel_gates_cpu_decode():
+    """The WNA16 kernel offers its CPU format to cpu/hybrid decode only where the CPU W4A16
+    executor implements it: silu, and group-128-whole hidden / intermediate dims."""
+    from freetoken.layers.quantization.moe.base import MoEConfig
+    from freetoken.layers.quantization.moe.wna16 import TritonWna16MoEKernel
+
+    k = TritonWna16MoEKernel()
+    assert k.cpu_format == "w4a16"
+    base = dict(num_experts=512, hidden=2560, intermediate=640, top_k=10, strategy="offload")
+    assert k.unusable_reason(MoEConfig(**base, decode_target="gpu")) is None
+    assert k.unusable_reason(MoEConfig(**base, decode_target="hybrid")) is None
+    assert k.unusable_reason(MoEConfig(**base, decode_target="cpu")) is None
+    assert "silu" in k.unusable_reason(MoEConfig(**base, decode_target="hybrid", activation="gelu"))
+    odd = dict(base, intermediate=576)  # 4.5 groups
+    assert "128" in k.unusable_reason(MoEConfig(**odd, decode_target="hybrid"))
+    assert k.unusable_reason(MoEConfig(**odd, decode_target="gpu")) is None  # GPU path unaffected
+
+
 @pytest.mark.parametrize("M", [1, 4])
 @pytest.mark.parametrize("split", [None, 1])
 def test_decode_matches_dequant_reference(M, split, monkeypatch):

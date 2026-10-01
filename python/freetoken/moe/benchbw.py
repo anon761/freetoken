@@ -63,9 +63,9 @@ logger = init_logger(__name__)
 
 # Formats the CPU MoE C++ kernel can compute AND this bench can build banks for; anything
 # else is offload-only here. (The kernel also does q4_0, but this bench has no q4_0 banks.)
-_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4"})
+_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4", "w4a16"})
 # Formats this bench can build synthetic (correctly-sized) banks for.
-_BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4"})
+_BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4", "w4a16"})
 # Friendlier CLI/display aliases for the internal quant_format strings.
 _FORMAT_ALIASES = {"fp8": "fp8_block", "mxfp4": "mxfp4_triton"}
 _FORMAT_DISPLAY = {"fp8_block": "fp8", "mxfp4_triton": "mxfp4"}
@@ -127,6 +127,8 @@ WORKLOADS: dict[str, Workload] = {
         activation="swiglu_clamp", swiglu_alpha=1.0, swiglu_limit=10.0,
     ),
     "minimax-m2.5": Workload("minimax-m2.5", 3072, 1536, 256, 8, ("nvfp4",)),
+    # ships as both AutoRound W4A16 and ModelOpt NVFP4, so one geometry compares the two
+    "qwen3.8-flash-next": Workload("qwen3.8-flash-next", 2560, 640, 512, 10, ("w4a16", "nvfp4")),
 }
 
 # Per-dtype canonical geometries for the TUNING bench (`--dtype`). The hybrid-vs-offload choice is
@@ -143,6 +145,7 @@ DTYPE_WORKLOADS: dict[str, Workload] = {
     "mxfp4_triton": Workload("dtype:mxfp4", 2880, 2880, 128, 4, ("mxfp4_triton",),
                              activation="gpt_oss_swiglu", swiglu_limit=7.0),
     "ds_fp4": Workload("dtype:ds_fp4", 4096, 2048, 128, 6, ("ds_fp4",), swiglu_limit=7.0),
+    "w4a16": Workload("dtype:w4a16", 2560, 640, 512, 10, ("w4a16",)),
 }
 
 
@@ -309,6 +312,13 @@ def _offload_bank_specs(fmt: str, H: int, I: int) -> dict[str, tuple[int, torch.
             "gate_up_packed": (2 * I * (H // 2), u8), "gate_up_scale": (2 * I * (H // 32), u8),
             "down_packed": (H * (I // 2), u8), "down_scale": (H * (I // 32), u8),
         }
+    if fmt == "w4a16":  # AutoGPTQ group-128: qweight, packed zero-points, fp16 scales
+        i32 = torch.int32
+        return {
+            "gate_up": ((H // 8) * 2 * I, i32), "gate_up_zero": ((H // 128) * (2 * I // 8), i32),
+            "gate_up_scale": ((H // 128) * 2 * I, f16), "down": ((I // 8) * H, i32),
+            "down_zero": ((I // 128) * (H // 8), i32), "down_scale": ((I // 128) * H, f16),
+        }
     raise NotImplementedError(fmt)
 
 
@@ -375,6 +385,18 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int) -> dict:
         }
         b["gate_up_scale"].fill_(127)  # e8m0 unit exponent
         b["down_scale"].fill_(127)
+        return b
+    if fmt == "w4a16":  # native AutoGPTQ, N innermost; any nibble is a valid code/zero
+        b = {
+            "gate_up": pin(E, H // 8, 2 * I, dtype=torch.int32),
+            "gate_up_zero": pin(E, H // 128, 2 * I // 8, dtype=torch.int32),
+            "gate_up_scale": pin(E, H // 128, 2 * I, dtype=torch.float16),
+            "down": pin(E, I // 8, H, dtype=torch.int32),
+            "down_zero": pin(E, I // 128, H // 8, dtype=torch.int32),
+            "down_scale": pin(E, I // 128, H, dtype=torch.float16),
+        }
+        b["gate_up_scale"].fill_(0.01)  # uninitialized fp16 can be NaN/denormal
+        b["down_scale"].fill_(0.01)
         return b
     raise NotImplementedError(fmt)
 
@@ -650,6 +672,9 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
                 elif fmt in ("mxfp4_triton", "ds_fp4"):
                     _note(entry, "isa tier labels are nominal: avx512bf16 == avx512f here "
                                  "(3 real kernels: scalar/avx2/avx512, no bf16/VNNI variant)")
+                elif fmt == "w4a16":
+                    _note(entry, "isa tier labels are nominal: w4a16 has 2 real kernels "
+                                 "(scalar/avx2, the +w4a16-* suffix names the one that ran)")
             entry["expert_bytes"] = entry["expert_bytes"] or c["expert_bytes"]
             entry["synth_experts"] = entry["synth_experts"] or c["synth_experts"]
         except (ImportError, RuntimeError) as e:

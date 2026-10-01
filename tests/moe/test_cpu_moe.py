@@ -19,6 +19,11 @@ import torch.nn.functional as Fn
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
+# One bf16 ulp at the bottom of a binade. CPU and GPU W4A16 round at the same points and
+# differ only in fp32 summation order (one flipped bf16 rounding): 240 random cases gave
+# max 2.0e-3 and 84% bit-identical, while a wrong nibble / zero / scale moves outputs by several percent.
+W4A16_TOL = 2**-7
+
 
 def _make_cache(L, E, H, I, scale=0.1):
     from freetoken.kernel.pinned import alloc_pinned_tensor
@@ -636,6 +641,183 @@ if __name__ == "__main__":
     test_cpu_moe_decode_cuda_graph_replay()
     test_cpu_moe_decode_cuda_graph_replay_mxfp4()
     test_cpu_moe_decode_cuda_graph_replay_dsfp4()
+
+
+W4A16_BANKS = ("gate_up", "gate_up_zero", "gate_up_scale", "down", "down_zero", "down_scale")
+
+
+def _make_w4a16_cache(L, E, H, I, seed=0):
+    """Random AutoRound / AutoGPTQ ``w4a16`` banks (native qweight/qzeros/scales, N innermost),
+    packed by the same helper the GPU WNA16 decode test uses. Also returns the dequantized
+    weights ([S, N, K] fp32) for a torch reference."""
+    from .test_wna16_decode import _expert_bank
+
+    torch.manual_seed(seed)
+    gu_qw, gu_qz, gu_sc, gu_w = _expert_bank(L * E, 2 * I, H, "cpu")
+    dn_qw, dn_qz, dn_sc, dn_w = _expert_bank(L * E, H, I, "cpu")
+    banks = dict(zip(W4A16_BANKS, (gu_qw, gu_qz, gu_sc, dn_qw, dn_qz, dn_sc)))
+    cache = SimpleNamespace(
+        quant_format="w4a16",
+        bank_sources={name: list(t.split(E)) for name, t in banks.items()},
+        num_layers=L,
+        num_experts=E,
+        decode_target="cpu",
+        cpu_executor=None,
+    )
+    return cache, gu_w, dn_w
+
+
+def _w4a16_executor(cache, top_k, bs, apply_in=False, **kw):
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    return CpuMoeExecutor(
+        cache, top_k=top_k, activation=kw.pop("activation", "silu"),
+        apply_router_weight_on_input=apply_in, num_threads=kw.pop("num_threads", 0),
+        max_tokens=bs, device=torch.device("cuda"), **kw,
+    )
+
+
+@pytest.mark.parametrize("isa", ["native", "scalar"])
+@pytest.mark.parametrize("apply_in", [False, True])
+@pytest.mark.parametrize("bs", [1, 3, 8])
+def test_cpu_decode_w4a16_matches_gpu(bs, apply_in, isa, monkeypatch):
+    """CPU W4A16 N-accumulator GEMV vs the production WNA16 decode kernel on byte-identical
+    AutoGPTQ banks and routing. Both round to bf16 at the same points (gate_up out, the
+    intermediate, each route's weighted down out), so only fp32 summation order differs."""
+    from freetoken.moe.fused_wna16 import fused_experts_decode_wna16
+
+    if isa == "scalar":
+        monkeypatch.setenv("FREETOKEN_CPU_MOE_ISA", "scalar")
+    L, E, H, I, top_k, layer = 2, 16, 512, 256, 4, 1
+    cache, _, _ = _make_w4a16_cache(L, E, H, I, seed=bs)
+    ex = _w4a16_executor(cache, top_k, bs, apply_in)
+    if isa == "scalar":
+        assert ex.isa.endswith("+w4a16-scalar"), ex.isa
+
+    dev = torch.device("cuda")
+    torch.manual_seed(400 + bs)
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
+    ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
+    w = torch.softmax(torch.randn(bs, top_k, device=dev), dim=-1)
+
+    cpu_out = ex.decode(layer, hidden, w, ids).float()
+    torch.cuda.synchronize()
+    banks = [cache.bank_sources[n][layer].to(dev) for n in W4A16_BANKS]
+    gpu_out = fused_experts_decode_wna16(hidden, *banks, w, ids, "silu", apply_in).float()
+
+    rel = (cpu_out - gpu_out).abs().max() / (gpu_out.abs().max() + 1e-6)
+    assert rel < W4A16_TOL, f"w4a16 {isa} bs={bs} apply_in={apply_in} rel err {rel.item()}"
+
+
+@pytest.mark.parametrize("isa", ["native", "scalar"])
+def test_cpu_decode_w4a16_matches_dequant_reference(isa, monkeypatch):
+    """CPU W4A16 vs a plain torch MoE over the dequantized weights (the reference the GPU
+    WNA16 decode test uses; it rounds only the intermediate, hence the looser bound)."""
+    if isa == "scalar":
+        monkeypatch.setenv("FREETOKEN_CPU_MOE_ISA", "scalar")
+    L, E, H, I, top_k, layer, bs = 2, 16, 512, 256, 4, 0, 4
+    cache, gu_w, dn_w = _make_w4a16_cache(L, E, H, I, seed=11)
+    ex = _w4a16_executor(cache, top_k, bs)
+
+    dev = torch.device("cuda")
+    torch.manual_seed(5)
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
+    ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
+    w = torch.softmax(torch.randn(bs, top_k, device=dev), dim=-1)
+    out = ex.decode(layer, hidden, w, ids).float().cpu()
+    torch.cuda.synchronize()
+
+    ref = torch.zeros(bs, H)
+    x, ids_c, w_c = hidden.float().cpu(), ids.cpu(), w.cpu()
+    for m in range(bs):
+        for j in range(top_k):
+            e = layer * E + int(ids_c[m, j])
+            h = gu_w[e] @ x[m]
+            act = Fn.silu(h[:I]) * h[I:]
+            ref[m] += w_c[m, j] * (dn_w[e] @ act.to(torch.bfloat16).float())
+    rel = (out - ref).abs().max() / ref.abs().max()
+    assert rel < 2e-2, f"w4a16 {isa} vs dequant rel err {rel.item()}"
+
+
+def test_cpu_moe_decode_cuda_graph_replay_w4a16():
+    """W4A16 under capture/replay: the host nodes must recompute from the freshly written
+    pinned activations/routing on each replay, and the flag handshake must come to rest."""
+    from freetoken.moe.fused_wna16 import fused_experts_decode_wna16
+
+    L, E, H, I, top_k, layer, bs = 2, 16, 512, 256, 4, 1, 4
+    cache, _, _ = _make_w4a16_cache(L, E, H, I, seed=7)
+    dev = torch.device("cuda")
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+    ex = _w4a16_executor(cache, top_k, bs, num_threads=8)
+    banks = [cache.bank_sources[n][layer].to(dev) for n in W4A16_BANKS]
+
+    torch.manual_seed(8)
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
+    ids = torch.randint(0, E, (bs, top_k), device=dev, dtype=torch.int32)
+    w = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
+
+    ex.decode(layer, hidden, w, ids)  # eager warmup: materialize buffers + task
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=stream):
+        out_cap = ex.decode(layer, hidden, w, ids)
+    torch.cuda.synchronize()
+
+    prev = None
+    for it in range(3):
+        torch.manual_seed(500 + it)
+        hidden.copy_(torch.randn(bs, H, dtype=torch.bfloat16))
+        ids.copy_(torch.randint(0, E, (bs, top_k), dtype=torch.int32))
+        w.copy_(torch.rand(bs, top_k, dtype=torch.float32))
+        g.replay()
+        torch.cuda.synchronize()
+        ref = fused_experts_decode_wna16(hidden, *banks, w, ids.clone(), "silu", False).float()
+        got = out_cap.float()
+        rel = (got - ref).abs().max() / (ref.abs().max() + 1e-6)
+        assert rel < W4A16_TOL, f"w4a16 replay {it} rel err {rel.item()}"
+        if prev is not None:
+            assert not torch.equal(got, prev), "replay output did not change with the new inputs"
+        prev = got.clone()
+    if ex._flag_slots:
+        slot = ex._flag_slots[(layer, bs)]
+        assert int(ex._done[slot]) == 1 and int(ex._ready[slot]) == 0, "handshake at rest"
+        assert int(ex._err.sum()) == 0, "watchdog must not fire in normal operation"
+    ex.raise_if_unhealthy()
+
+
+def _w4a16_mutate(cache, role, fn):
+    cache.bank_sources[role] = [fn(t) for t in cache.bank_sources[role]]
+
+
+@pytest.mark.parametrize("case", [
+    "qweight_dtype", "scale_dtype", "zero_shape", "group_64", "noncontig", "missing_bank",
+])
+def test_w4a16_rejects_malformed_banks(case):
+    """Banks the W4A16 executor does not implement must fail loudly, never compute."""
+    L, E, H, I = 1, 4, 256, 128
+    cache, _, _ = _make_w4a16_cache(L, E, H, I)
+    if case == "qweight_dtype":
+        _w4a16_mutate(cache, "gate_up", lambda t: t.to(torch.int64))
+    elif case == "scale_dtype":
+        _w4a16_mutate(cache, "down_scale", lambda t: t.to(torch.bfloat16))
+    elif case == "zero_shape":
+        _w4a16_mutate(cache, "gate_up_zero", lambda t: t[:, :, :-1].contiguous())
+    elif case == "group_64":  # group-64 scales/zeros: twice the K groups of a group-128 bank
+        _w4a16_mutate(cache, "gate_up_scale", lambda t: t.repeat_interleave(2, dim=1).contiguous())
+    elif case == "noncontig":
+        _w4a16_mutate(cache, "down", lambda t: t.transpose(1, 2).contiguous().transpose(1, 2))
+    elif case == "missing_bank":
+        del cache.bank_sources["down_zero"]
+    with pytest.raises((ValueError, NotImplementedError)):
+        _w4a16_executor(cache, 2, 1)
+
+
+def test_w4a16_rejects_non_silu():
+    """The CPU W4A16 epilogue is silu only; any other activation is refused at construction."""
+    cache, _, _ = _make_w4a16_cache(1, 4, 256, 128)
+    with pytest.raises(RuntimeError, match="silu"):
+        _w4a16_executor(cache, 2, 1, activation="gelu")
 
 
 def test_cpu_moe_executor_is_collectable():
