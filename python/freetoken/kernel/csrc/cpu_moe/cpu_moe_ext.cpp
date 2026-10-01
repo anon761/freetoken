@@ -1019,6 +1019,125 @@ mxgemv_fn select_mxgemv() {
   return mxfp4_gemv_scalar;
 }
 
+// ---------------------- W4A16 (AutoRound / AutoGPTQ) GEMV ----------------------
+// Native AutoGPTQ banks, N innermost: qweight[K/8, N] int32 (code j of a word = K row 8w+j),
+// qzeros[K/128, N/8] int32 (8 columns per word, stored as zero-point - 1), scales[K/128, N]
+// fp16. w = (code - zero) * scale, as in kernel/triton/wna16_fused_moe.py. The pointers are
+// offset to the tile's first column, which must be a multiple of 8 so column c's zero is
+// nibble (c & 7) of word (c >> 3). Activations stay bf16 -> fp32 (no activation quantization).
+using w4gemv_fn = void (*)(float*, const int32_t*, const int32_t*, const uint16_t*,
+                           const bf16_t*, int, int, int);
+
+void w4a16_gemv_scalar(float* out, const int32_t* qw, const int32_t* qz, const uint16_t* sc,
+                       const bf16_t* x, int Kw, int N, int ncol) {
+  const int groups = Kw / 16, Nz = N / 8;
+  for (int c = 0; c < ncol; ++c) {
+    float o = 0.0f;
+    for (int g = 0; g < groups; ++g) {
+      const uint32_t zw = static_cast<uint32_t>(qz[(size_t)g * Nz + (c >> 3)]);
+      const int zero = static_cast<int>((zw >> (4 * (c & 7))) & 0xFu) + 1;
+      float part = 0.0f;
+      for (int r = 0; r < 16; ++r) {
+        const int kw = g * 16 + r;
+        const uint32_t word = static_cast<uint32_t>(qw[(size_t)kw * N + c]);
+        for (int j = 0; j < 8; ++j)
+          part += static_cast<float>(static_cast<int>((word >> (4 * j)) & 0xFu) - zero) *
+                  bf16_to_f32(x[8 * kw + j]);
+      }
+      o += part * fp16_to_f32(sc[(size_t)g * N + c]);
+    }
+    out[c] = o;
+  }
+}
+
+#if CPU_MOE_X86
+// NC chunks of 8 columns over fp32 x (xf) and its per-128 group sums (gs).
+// sum_k (q - z) * x = sum_k q * x - z * sum_k x keeps the zero subtract out of the inner
+// loop; (q - z) is exact, so only the fp32 summation order differs from the GPU kernel.
+template <int NC>
+__attribute__((target("avx2,fma,f16c")))
+static inline void w4a16_tile_avx2(float* out, const int32_t* qw, const int32_t* qz,
+                                   const uint16_t* sc, const float* xf, const float* gs,
+                                   int Kw, int N) {
+  const int groups = Kw / 16, Nz = N / 8;
+  const __m256i mask = _mm256_set1_epi32(0xF);
+  const __m256i zshift = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+  const __m256i one = _mm256_set1_epi32(1);
+  __m256 acc[NC];
+  for (int ci = 0; ci < NC; ++ci) acc[ci] = _mm256_setzero_ps();
+  for (int g = 0; g < groups; ++g) {
+    __m256 blk[NC];
+    for (int ci = 0; ci < NC; ++ci) blk[ci] = _mm256_setzero_ps();
+    for (int r = 0; r < 16; ++r) {
+      const int kw = g * 16 + r;
+      // K strides by N words and crosses a page per row; the HW streamer will not follow.
+      constexpr int PFD = 8;
+      if (kw + PFD < Kw) {
+        const char* pf = reinterpret_cast<const char*>(qw + (size_t)(kw + PFD) * N);
+        for (int b = 0; b < NC * 32; b += 64) _mm_prefetch(pf + b, _MM_HINT_T0);
+      }
+      __m256i w[NC];
+      for (int ci = 0; ci < NC; ++ci)
+        w[ci] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qw + (size_t)kw * N + ci * 8));
+      const float* xk = xf + 8 * kw;
+      for (int j = 0; j < 8; ++j) {
+        const __m256 xb = _mm256_broadcast_ss(xk + j);
+        for (int ci = 0; ci < NC; ++ci) {
+          blk[ci] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_and_si256(w[ci], mask)), xb, blk[ci]);
+          w[ci] = _mm256_srli_epi32(w[ci], 4);
+        }
+      }
+    }
+    const __m256 xs = _mm256_set1_ps(gs[g]);
+    for (int ci = 0; ci < NC; ++ci) {
+      const __m256 s = _mm256_cvtph_ps(
+          _mm_loadu_si128(reinterpret_cast<const __m128i*>(sc + (size_t)g * N + ci * 8)));
+      const __m256i zw = _mm256_set1_epi32(qz[(size_t)g * Nz + ci]);
+      const __m256 z = _mm256_cvtepi32_ps(
+          _mm256_add_epi32(_mm256_and_si256(_mm256_srlv_epi32(zw, zshift), mask), one));
+      acc[ci] = _mm256_fmadd_ps(_mm256_fnmadd_ps(z, xs, blk[ci]), s, acc[ci]);
+    }
+  }
+  for (int ci = 0; ci < NC; ++ci) _mm256_storeu_ps(out + ci * 8, acc[ci]);
+}
+
+__attribute__((target("avx2,fma,f16c")))
+void w4a16_gemv_avx2(float* out, const int32_t* qw, const int32_t* qz, const uint16_t* sc,
+                     const bf16_t* x, int Kw, int N, int ncol) {
+  // x -> fp32 once per call (shared by every column), plus its per-group sums.
+  thread_local std::vector<float> xbuf;
+  const int K = Kw * 8, groups = Kw / 16;
+  if ((int)xbuf.size() < K + groups) xbuf.resize(K + groups);
+  float* xf = xbuf.data();
+  float* gs = xf + K;
+  for (int g = 0; g < groups; ++g) {
+    __m256 sum = _mm256_setzero_ps();
+    for (int k = g * 128; k < g * 128 + 128; k += 8) {
+      const __m256i v = _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(x + k)));
+      const __m256 f = _mm256_castsi256_ps(_mm256_slli_epi32(v, 16));
+      _mm256_storeu_ps(xf + k, f);
+      sum = _mm256_add_ps(sum, f);
+    }
+    gs[g] = hsum256(sum);
+  }
+  int c = 0;
+  for (; c + 32 <= ncol; c += 32) w4a16_tile_avx2<4>(out + c, qw + c, qz + c / 8, sc + c, xf, gs, Kw, N);
+  const int rem = (ncol - c) / 8;
+  if (rem == 3) w4a16_tile_avx2<3>(out + c, qw + c, qz + c / 8, sc + c, xf, gs, Kw, N);
+  if (rem == 2) w4a16_tile_avx2<2>(out + c, qw + c, qz + c / 8, sc + c, xf, gs, Kw, N);
+  if (rem == 1) w4a16_tile_avx2<1>(out + c, qw + c, qz + c / 8, sc + c, xf, gs, Kw, N);
+  c += rem * 8;
+  if (c < ncol) w4a16_gemv_scalar(out + c, qw + c, qz + c / 8, sc + c, x, Kw, N, ncol - c);
+}
+#endif
+
+w4gemv_fn select_w4gemv() {
+#if CPU_MOE_X86
+  if (pick_isa() >= ISA_AVX2 && __builtin_cpu_supports("f16c")) return w4a16_gemv_avx2;
+#endif
+  return w4a16_gemv_scalar;
+}
+
 // Round a clamped |x|<=448 to nearest float8-e4m3 (RNE), back to fp32. Matches
 // torch.float8_e4m3fn / triton .to(float8e4nv).
 inline float e4m3_round(float x) {
@@ -1220,7 +1339,7 @@ q4dot_fn select_q4dot() {
   return q4_0_dot_i8_scalar;
 }
 
-enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4 };
+enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4, WF_W4A16 = 5 };
 
 // Each ctor pointer arg is the address of a CPU int64 array of length
 // num_layers (one base address per layer, built by cpu_executor.py's
@@ -1241,7 +1360,8 @@ struct CpuMoeExecutor {
   // Per-layer pointer tables (one base address per layer, see tbl_at). gate_up_tbl
   // doubles as the bf16 gate_up table and the nvfp4/mxfp4/q4_0/ds_fp4 packed-gate_up
   // table (down_tbl likewise for down); which reinterpretation applies is picked by
-  // fmt at each resolve site (see gemm1_dot/gemm2_dot/do_pass1_mxfp4/do_pass1_dsfp4).
+  // fmt at each resolve site (see gemm1_dot/gemm2_dot/do_pass1_mxfp4/do_pass1_dsfp4/
+  // do_pass1_w4a16).
   const uint64_t* gate_up_tbl;   // bf16: [E,2I,H] rows; else: packed e2m1/mxfp4-blocks
   const uint64_t* down_tbl;      // bf16: [E,H,I] rows; else: packed e2m1/mxfp4-blocks
   const uint64_t* gu_scale_tbl;  // nvfp4/mxfp4/ds_fp4: [E,2I,*] block scales
@@ -1250,6 +1370,10 @@ struct CpuMoeExecutor {
   const uint64_t* dn_global_tbl; // nvfp4: [E,H] fp16 row globals
   const uint64_t* gu_bias_tbl;   // mxfp4: [E,2I] bf16 biases
   const uint64_t* dn_bias_tbl;   // mxfp4: [E,H] bf16 biases
+  // w4a16 reuses gate_up/down (qweight) and the *_scale tables (fp16 group scales) and adds
+  // the packed zero-points: [E,H/128,2I/8] and [E,I/128,H/8] int32.
+  const uint64_t* gu_zero_tbl;
+  const uint64_t* dn_zero_tbl;
   float swiglu_alpha;
   float swiglu_limit;          // +inf == no clamp
   dot_fn dot;
@@ -1260,6 +1384,7 @@ struct CpuMoeExecutor {
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
   q4dot_fn q4dot;
+  w4gemv_fn w4gemv;
   // ds_fp4: the caller already FP8-round-tripped the input activations on the GPU
   // (same reference grid), so submit() must not repeat it on the host-callback
   // thread. That scalar per-element pass is single-threaded ON THE DECODE CRITICAL
@@ -1356,7 +1481,8 @@ struct CpuMoeExecutor {
                  uintptr_t gate_up_global_ptr, uintptr_t down_scale_ptr,
                  uintptr_t down_global_ptr, uintptr_t gate_up_bias_ptr,
                  uintptr_t down_bias_ptr, double swiglu_alpha_, double swiglu_limit_,
-                 std::vector<int> core_ids_)
+                 std::vector<int> core_ids_, uintptr_t gate_up_zero_ptr = 0,
+                 uintptr_t down_zero_ptr = 0)
       : num_threads(num_threads_ > 0 ? num_threads_ : 1),
         num_layers(num_layers_),
         num_experts(num_experts_),
@@ -1374,6 +1500,8 @@ struct CpuMoeExecutor {
         dn_global_tbl(reinterpret_cast<const uint64_t*>(down_global_ptr)),
         gu_bias_tbl(reinterpret_cast<const uint64_t*>(gate_up_bias_ptr)),
         dn_bias_tbl(reinterpret_cast<const uint64_t*>(down_bias_ptr)),
+        gu_zero_tbl(reinterpret_cast<const uint64_t*>(gate_up_zero_ptr)),
+        dn_zero_tbl(reinterpret_cast<const uint64_t*>(down_zero_ptr)),
         swiglu_alpha(static_cast<float>(swiglu_alpha_)),
         swiglu_limit(static_cast<float>(swiglu_limit_)),
         core_ids(std::move(core_ids_)) {
@@ -1383,6 +1511,16 @@ struct CpuMoeExecutor {
     dsdot = select_dsdot();
     mxgemv = select_mxgemv();
     q4dot = select_q4dot();
+    w4gemv = select_w4gemv();
+    if (weight_format == WF_W4A16) {
+      // I % 128 also puts the up half (column I + i0) on a zero-word boundary.
+      if (H % 128 != 0 || I % 128 != 0)
+        throw std::runtime_error("W4A16 CPU MoE requires H and I to be multiples of the group size 128");
+      if (!gate_up_tbl || !down_tbl || !gu_scale_tbl || !dn_scale_tbl || !gu_zero_tbl || !dn_zero_tbl)
+        throw std::runtime_error("W4A16 CPU MoE needs the qweight, zero and scale tables of both projections");
+      if (act != ACT_SILU)
+        throw std::runtime_error("W4A16 CPU MoE supports silu experts only");
+    }
     if (weight_format == WF_Q4_0) {
       if (H % 32 != 0 || I % 32 != 0)
         throw std::runtime_error("Q4_0 CPU MoE requires H and I to be multiples of 32");
@@ -1399,7 +1537,10 @@ struct CpuMoeExecutor {
     const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8") : "";
     const char* vnni_tag =
         cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)" : "+vnni(nvfp4-w4a8)";
-    isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag;
+    const char* w4tag = weight_format != WF_W4A16      ? ""
+                        : w4gemv == w4a16_gemv_scalar ? "+w4a16-scalar"
+                                                      : "+w4a16-avx2";
+    isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag + w4tag;
     isa = isa_str.c_str();
     for (int i = 0; i < 16; ++i) e2m1_lut[i] = kE2M1[i];
     for (int i = 0; i < 256; ++i) e4m3_lut[i] = e4m3_decode((uint8_t)i);
@@ -1580,6 +1721,10 @@ struct CpuMoeExecutor {
   }
 
   void do_pass1(const MoeTask* t, int64_t p) {
+    if (fmt == WF_W4A16) {
+      do_pass1_w4a16(t, p);
+      return;
+    }
     if (fmt == WF_MXFP4) {
       do_pass1_mxfp4(t, p);
       return;
@@ -1637,6 +1782,10 @@ struct CpuMoeExecutor {
   }
 
   void do_pass2(const MoeTask* t, int64_t p) {
+    if (fmt == WF_W4A16) {
+      do_pass2_w4a16(t, p);
+      return;
+    }
     if (fmt == WF_MXFP4) {
       do_pass2_mxfp4(t, p);
       return;
@@ -1747,6 +1896,66 @@ struct CpuMoeExecutor {
       mxgemv(part, blk_e + h0, scl_e + h0, g_row, Ih, H, nh, e2m1_lut, e8m0_lut);
       const bf16_t* bias_e = dn_bias_l + (size_t)e * H + h0;
       for (int c = 0; c < nh; ++c) acc[c] += (part[c] + bf16_to_f32(bias_e[c])) * wt;
+    }
+    bf16_t* y_row = t->y + (size_t)tok * H;
+    for (int c = 0; c < nh; ++c) y_row[h0 + c] = f32_to_bf16(acc[c]);
+  }
+
+  // ------------------------- W4A16 (AutoRound / AutoGPTQ) ----------------------
+  // gate_up is [E, H/8, 2I] with gate in columns [0, I) and up in [I, 2I) (concatenated,
+  // unlike mxfp4's interleave); down is [E, I/8, H]. bf16 rounding follows
+  // fused_experts_decode_wna16, which stores the gate_up output, the activated intermediate
+  // and each route's weighted down output as bf16 before summing the routes.
+
+  void do_pass1_w4a16(const MoeTask* t, int64_t p) {
+    const int64_t ib = p % n_iblk;
+    const int64_t tk = p / n_iblk;
+    const int k = static_cast<int>(tk % top_k);
+    const int tok = static_cast<int>(tk / top_k);
+    const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
+    if (e < 0 || e >= num_experts) return;
+    const int32_t* qw_l = reinterpret_cast<const int32_t*>(tbl_at(gate_up_tbl, t->layer_id));
+    const int32_t* qz_l = reinterpret_cast<const int32_t*>(tbl_at(gu_zero_tbl, t->layer_id));
+    const uint16_t* sc_l = reinterpret_cast<const uint16_t*>(tbl_at(gu_scale_tbl, t->layer_id));
+    const int N = 2 * I, Kw = H / 8, G = H / 128;
+    const int32_t* qw_e = qw_l + (size_t)e * Kw * N;
+    const int32_t* qz_e = qz_l + (size_t)e * G * (N / 8);
+    const uint16_t* sc_e = sc_l + (size_t)e * G * N;
+    const int i0 = static_cast<int>(ib) * IBLK;
+    const int nunit = std::min(I, i0 + IBLK) - i0;
+    const bf16_t* x_row = t->x + (size_t)tok * H;
+    float gate[IBLK], up[IBLK];
+    w4gemv(gate, qw_e + i0, qz_e + i0 / 8, sc_e + i0, x_row, Kw, N, nunit);
+    w4gemv(up, qw_e + I + i0, qz_e + (I + i0) / 8, sc_e + I + i0, x_row, Kw, N, nunit);
+    const float w_in = apply_on_input ? t->w[static_cast<size_t>(tok) * top_k + k] : 1.0f;
+    bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
+    for (int j = 0; j < nunit; ++j) {
+      const float gv = bf16_to_f32(f32_to_bf16(gate[j] * w_in));
+      const float uv = bf16_to_f32(f32_to_bf16(up[j] * w_in));
+      g_row[i0 + j] = f32_to_bf16(act_apply(ACT_SILU, gv) * uv);
+    }
+  }
+
+  void do_pass2_w4a16(const MoeTask* t, int64_t p) {
+    const int64_t hb = p % n_hblk;
+    const int tok = static_cast<int>(p / n_hblk);
+    const int h0 = static_cast<int>(hb) * HBLK;
+    const int nh = std::min(H, h0 + HBLK) - h0;
+    const int32_t* qw_l = reinterpret_cast<const int32_t*>(tbl_at(down_tbl, t->layer_id));
+    const int32_t* qz_l = reinterpret_cast<const int32_t*>(tbl_at(dn_zero_tbl, t->layer_id));
+    const uint16_t* sc_l = reinterpret_cast<const uint16_t*>(tbl_at(dn_scale_tbl, t->layer_id));
+    const int Kw = I / 8, G = I / 128;
+    float acc[HBLK];
+    for (int c = 0; c < nh; ++c) acc[c] = 0.0f;
+    for (int k = 0; k < top_k; ++k) {
+      const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
+      if (e < 0 || e >= num_experts) continue;
+      const float w_out = apply_on_input ? 1.0f : t->w[static_cast<size_t>(tok) * top_k + k];
+      const bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
+      float part[HBLK];
+      w4gemv(part, qw_l + (size_t)e * Kw * H + h0, qz_l + (size_t)e * G * (H / 8) + h0 / 8,
+             sc_l + (size_t)e * G * H + h0, g_row, Kw, H, nh);
+      for (int c = 0; c < nh; ++c) acc[c] += bf16_to_f32(f32_to_bf16(part[c] * w_out));
     }
     bf16_t* y_row = t->y + (size_t)tok * H;
     for (int c = 0; c < nh; ++c) y_row[h0 + c] = f32_to_bf16(acc[c]);
@@ -2116,7 +2325,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<CpuMoeExecutor>(m, "CpuMoeExecutor")
       .def(py::init<int, int, int, int, int, int, int, int, int, int, uintptr_t, uintptr_t,
                     uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
-                    double, double, std::vector<int>>(),
+                    double, double, std::vector<int>, uintptr_t, uintptr_t>(),
            py::arg("num_threads"), py::arg("num_layers"), py::arg("num_experts"),
            py::arg("top_k"), py::arg("hidden_size"), py::arg("inter_size"),
            py::arg("max_tokens"), py::arg("activation_id"),
@@ -2125,7 +2334,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("gate_up_global_ptr"), py::arg("down_scale_ptr"),
            py::arg("down_global_ptr"), py::arg("gate_up_bias_ptr"),
            py::arg("down_bias_ptr"), py::arg("swiglu_alpha"), py::arg("swiglu_limit"),
-           py::arg("core_ids"))
+           py::arg("core_ids"), py::arg("gate_up_zero_ptr") = (uintptr_t)0,
+           py::arg("down_zero_ptr") = (uintptr_t)0)
       .def("create_task", &CpuMoeExecutor::create_task, py::arg("layer_id"),
            py::arg("num_tokens"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
            py::arg("y_ptr"))

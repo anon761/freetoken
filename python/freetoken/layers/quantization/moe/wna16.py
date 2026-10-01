@@ -35,14 +35,30 @@ class TritonWna16MoEKernel(MoEKernel):
     """FreeToken's inline-dequant kernels over the native AutoGPTQ INT4 rows."""
 
     name = "triton"
-    cpu_format = None
+    cpu_format = "w4a16"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=False, plain_silu_only=False)
+        reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
         reason = gated_epilogue_reason(cfg)
-        return f"triton wna16 MoE kernel: {reason}" if reason else None
+        if reason:
+            return f"triton wna16 MoE kernel: {reason}"
+        return self._cpu_reason(cfg) if cfg.decode_target != "gpu" else None
+
+    @staticmethod
+    def _cpu_reason(cfg: MoEConfig) -> str | None:
+        """What the CPU W4A16 executor (cpu_moe_ext.cpp, WF_W4A16) implements: silu experts
+        over group-128 banks whose K dims (hidden, the rank's intermediate) are whole groups."""
+        from freetoken.models.wna16_banks import wna16_tp_geometry
+
+        if cfg.activation != "silu":
+            return f"the CPU W4A16 executor supports silu experts only, not {cfg.activation!r}"
+        k_lo, k_hi = wna16_tp_geometry(cfg.intermediate, cfg.tp_size, cfg.tp_rank)
+        if cfg.hidden % 128 or (k_hi - k_lo) % 128:
+            return (f"the CPU W4A16 executor needs hidden ({cfg.hidden}) and intermediate "
+                    f"({k_hi - k_lo}) to be multiples of the group size 128")
+        return None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         from freetoken.models.wna16_banks import wna16_tp_geometry

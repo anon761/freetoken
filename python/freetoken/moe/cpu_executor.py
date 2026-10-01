@@ -69,7 +69,7 @@ _ACT_IDS = {
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4, "w4a16": 5}
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -143,7 +143,7 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
 
 class CpuMoeExecutor:
     """Decode-time CPU expert compute over an ``OffloadMoeCache``'s host banks
-    (bf16, nvfp4, mxfp4_triton, ds_fp4 or q4_0 — see ``_WFMT_IDS`` / ``_resolve_banks``)."""
+    (bf16, nvfp4, mxfp4_triton, ds_fp4, q4_0 or w4a16 — see ``_WFMT_IDS`` / ``_resolve_banks``)."""
 
     def __init__(
         self,
@@ -378,6 +378,9 @@ class CpuMoeExecutor:
         if fmt == "ds_fp4":
             return self._resolve_dsfp4_banks(banks)
 
+        if fmt == "w4a16":
+            return self._resolve_w4a16_banks(banks)
+
         # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp16 row globals.
         gup, gus, gug = banks["gate_up"], banks["gate_up_scale"], banks["gate_up_global"]
         dnp, dns, dng = banks["down"], banks["down_scale"], banks["down_global"]
@@ -487,6 +490,52 @@ class CpuMoeExecutor:
             down_global_ptr=0,
             gate_up_bias_ptr=0,
             down_bias_ptr=0,
+        )
+        return ptrs, (H, I)
+
+    def _resolve_w4a16_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
+        """AutoRound / AutoGPTQ W4A16 schema, native and N innermost: qweight [K/8, N] int32,
+        qzeros [K/128, N/8] int32 (stored zero-point - 1), scales [K/128, N] fp16, for gate_up
+        (K=H, N=2I, gate columns then up columns) and down (K=I, N=H). The C++ GEMV streams K
+        and accumulates a contiguous N-block of these same banks in place: no repack, no copy."""
+        roles = ("gate_up", "gate_up_zero", "gate_up_scale", "down", "down_zero", "down_scale")
+        missing = [r for r in roles if r not in banks]
+        if missing:
+            raise ValueError(f"w4a16 CPU MoE: missing banks {missing}")
+        b = {r: banks[r] for r in roles}
+        for r in roles:
+            want = torch.float16 if r.endswith("_scale") else torch.int32
+            if b[r][0].dtype != want:
+                raise ValueError(f"w4a16 CPU MoE: {r} must be {want}, got {b[r][0].dtype}")
+            if not all(t.is_contiguous() for t in b[r]):
+                raise ValueError(f"w4a16 CPU MoE: {r} banks must be contiguous (read in place)")
+        H = int(b["gate_up"][0].shape[1]) * 8
+        I = int(b["gate_up"][0].shape[2]) // 2
+        if H % 128 or I % 128:
+            raise NotImplementedError(
+                f"w4a16 CPU MoE implements group-128 banks with whole groups: H={H}, I={I}")
+        expect = {
+            "gate_up": (H // 8, 2 * I), "gate_up_zero": (H // 128, 2 * I // 8),
+            "gate_up_scale": (H // 128, 2 * I), "down": (I // 8, H),
+            "down_zero": (I // 128, H // 8), "down_scale": (I // 128, H),
+        }
+        for r, shape in expect.items():
+            got = tuple(b[r][0].shape[1:])
+            if got != shape:
+                raise ValueError(
+                    f"w4a16 CPU MoE: {r} is {got} per expert, expected {shape} "
+                    "(group-128 AutoGPTQ layout)")
+        ptrs = dict(
+            gate_up_ptr=self._make_table(b["gate_up"]).data_ptr(),
+            down_ptr=self._make_table(b["down"]).data_ptr(),
+            gate_up_scale_ptr=self._make_table(b["gate_up_scale"]).data_ptr(),
+            gate_up_global_ptr=0,
+            down_scale_ptr=self._make_table(b["down_scale"]).data_ptr(),
+            down_global_ptr=0,
+            gate_up_bias_ptr=0,
+            down_bias_ptr=0,
+            gate_up_zero_ptr=self._make_table(b["gate_up_zero"]).data_ptr(),
+            down_zero_ptr=self._make_table(b["down_zero"]).data_ptr(),
         )
         return ptrs, (H, I)
 
