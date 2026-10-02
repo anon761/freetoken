@@ -7,6 +7,7 @@ grouped GEMMs read the packed-int4 expert cache (AutoGPTQ ``qweight``/``qzeros``
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict
 
 import torch
@@ -17,6 +18,7 @@ from freetoken.kernel.triton.wna16_fused_moe import (
     _decode_wna16_moe_kernel,
     _decode_wna16_splitk_reduce,
     _prefill_wna16_moe_kernel,
+    _prefill_wna16_moe_tile_kernel,
     _tl_dtype,
 )
 from freetoken.layers import gated_act_and_mul
@@ -35,7 +37,7 @@ def _decode_config(routes: int, N: int, K: int) -> Dict[str, int]:
 
     A decode step has few routes, so narrow single-warp programs plus a deterministic
     split-K fill the SMs; the split grows until ~_DECODE_TARGET_PROGRAMS. RTX 3090,
-    Qwen3.8-Flash-Next per rank (gate_up 640x2560, down 2560x320), M=1 / M=4: gate_up
+    Qwen3.8-Flash-Next per rank (gate_up 2560x2I, down Ix2560, I = 256 / 384), M=1 / M=4: gate_up
     43 -> 19 / 170 -> 56 us, down 28 -> 10 / 91 -> 29 us."""
     programs = routes * triton.cdiv(N, _DECODE_BLOCK_N)
     n_kb = triton.cdiv(K // 8, _DECODE_BLOCK_KW)
@@ -56,6 +58,7 @@ def _decode_gemm(
     mul_routed_weight: bool,
     a_row_is_route: bool,
     cfg: Dict[str, int] | None = None,
+    k_off: int = 0,
 ) -> None:
     M, top_k = topk_ids.shape
     N = qw.shape[2]
@@ -71,7 +74,7 @@ def _decode_gemm(
     grid = (total_routes, triton.cdiv(N, cfg["BLOCK_SIZE_N"]), split)
     _decode_wna16_moe_kernel[grid](
         a, qw, qz, sc, c, part, topk_weights, topk_ids,
-        total_routes, N, K, kb_per, GROUP,
+        total_routes, N, K, kb_per, k_off, GROUP,
         a.stride(0), a.stride(1),
         qw.stride(0), qw.stride(1), qw.stride(2),
         qz.stride(0), qz.stride(1), qz.stride(2),
@@ -104,6 +107,30 @@ def _prefill_config(M: int) -> Dict[str, int]:
                 GROUP_SIZE_M=8, num_warps=8, num_stages=4)
 
 
+# Tile-dequant prefill kernel (one dot per K step). RTX 3080 20GB, Qwen3.8-Flash-Next
+# rank-1 band (gate_up 2560x768, down 384x2560), 10 of 512 experts: at M=8192 gate_up
+# 52 -> 10 ms and down 39 -> 6 ms against the per-nibble kernel, 5-7x at M=64..2048.
+_TILE_GATE_UP = dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=128, BLOCK_SIZE_K=64,
+                     GROUP_SIZE_M=8, num_warps=8, num_stages=3)
+
+
+def _tile_down_config(M: int) -> Dict[str, int]:
+    if M >= 4096:
+        return dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64,
+                    GROUP_SIZE_M=8, num_warps=4, num_stages=2)
+    return dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64,
+                GROUP_SIZE_M=8, num_warps=8, num_stages=2)
+
+
+def _tile_ok(K: int, cfg: Dict[str, int], k_off: int = 0) -> bool:
+    bk = cfg["BLOCK_SIZE_K"]
+    return K % bk == 0 and k_off % bk == 0 and GROUP % bk == 0
+
+
+def _legacy_prefill() -> bool:
+    return os.environ.get("FREETOKEN_WNA16_PREFILL_LEGACY", "") == "1"
+
+
 def _prefill_gemm(
     a: torch.Tensor,
     qw: torch.Tensor,
@@ -118,6 +145,7 @@ def _prefill_gemm(
     kernel_top_k: int,
     mul_routed_weight: bool,
     cfg: Dict[str, Any],
+    k_off: int = 0,
 ) -> None:
     N = qw.shape[2]
     K = qw.shape[1] * 8
@@ -125,10 +153,11 @@ def _prefill_gemm(
     grid = lambda META: (  # noqa: E731
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    _prefill_wna16_moe_kernel[grid](
+    kernel = _prefill_wna16_moe_tile_kernel if "BLOCK_SIZE_K" in cfg else _prefill_wna16_moe_kernel
+    kernel[grid](
         a, qw, qz, sc, c, topk_weights_flat, sorted_ids, expert_ids,
         num_tokens_post_padded,
-        N, K, EM, num_valid_tokens, GROUP,
+        N, K, EM, num_valid_tokens, k_off, GROUP,
         a.stride(0), a.stride(1),
         qw.stride(0), qw.stride(1), qw.stride(2),
         qz.stride(0), qz.stride(1), qz.stride(2),
@@ -161,6 +190,7 @@ def fused_experts_decode_wna16(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    down_k_off: int = 0,
 ) -> torch.Tensor:
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
@@ -175,7 +205,8 @@ def fused_experts_decode_wna16(
     gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _decode_gemm(ic2, down_qw, down_qz, down_sc, ic3,
-                 topk_weights, topk_ids, not apply_router_weight_on_input, True)
+                 topk_weights, topk_ids, not apply_router_weight_on_input, True,
+                 k_off=down_k_off)
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
     return out
@@ -196,28 +227,33 @@ def fused_experts_wna16(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    down_k_off: int = 0,
 ) -> torch.Tensor:
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_qw.shape[2]
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
-    cfg = _prefill_config(M)
+    cfg_gu, cfg_dn = _TILE_GATE_UP, _tile_down_config(M)
+    if _legacy_prefill() or not (_tile_ok(H, cfg_gu) and _tile_ok(inter, cfg_dn, down_k_off)):
+        cfg_gu = cfg_dn = _prefill_config(M)
 
-    sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
+    align_gu = moe_align_block_size(topk_ids, cfg_gu["BLOCK_SIZE_M"], num_experts)
+    align_dn = (align_gu if cfg_dn["BLOCK_SIZE_M"] == cfg_gu["BLOCK_SIZE_M"]
+                else moe_align_block_size(topk_ids, cfg_dn["BLOCK_SIZE_M"], num_experts))
     tw = topk_weights.reshape(-1).contiguous()
     num_valid = topk_ids.numel()
 
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
     _prefill_gemm(hidden_states, gate_up_qw, gate_up_qz, gate_up_sc, ic1,
-                  tw, sorted_ids, expert_ids, ntpp, num_valid, top_k,
-                  apply_router_weight_on_input, cfg)
+                  tw, *align_gu, num_valid, top_k,
+                  apply_router_weight_on_input, cfg_gu)
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
     gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _prefill_gemm(ic2, down_qw, down_qz, down_sc, ic3,
-                  tw, sorted_ids, expert_ids, ntpp, num_valid, 1,
-                  not apply_router_weight_on_input, cfg)
+                  tw, *align_dn, num_valid, 1,
+                  not apply_router_weight_on_input, cfg_dn, k_off=down_k_off)
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
     return out

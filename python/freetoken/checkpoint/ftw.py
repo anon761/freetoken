@@ -775,9 +775,14 @@ def load_ftw_banks(
                 # WNA16 group scales live on K and cannot split mid-group; the rank band
                 # is group-aligned (may differ by one group across ranks) and gate_up's
                 # output slice uses the SAME extent so it matches down's input.
-                from freetoken.models.wna16_banks import wna16_tp_geometry
+                from freetoken.models.wna16_banks import wna16_balanced_tp, wna16_tp_geometry
 
                 I_full = int(model_config.moe_intermediate_size)
+                if wna16_balanced_tp(I_full, tp.size):
+                    raise NotImplementedError(
+                        "FREETOKEN_WNA16_BALANCED_TP is implemented for HF checkpoints only; "
+                        "unset it to serve an FTW"
+                    )
                 lo, hi = wna16_tp_geometry(I_full, tp.size, tp.rank)
                 tp_loc = (I_full, hi - lo, lo, hi)
             else:

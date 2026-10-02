@@ -47,6 +47,7 @@ def _decode_wna16_moe_kernel(
     N,
     K,
     kb_per,            # K blocks (of BLOCK_SIZE_KW words) per split
+    K_OFF,             # this band's first K row inside its first group (balanced TP)
     GROUP: tl.constexpr,
     stride_am, stride_ak,
     stride_qe, stride_qkw, stride_qn,
@@ -91,7 +92,7 @@ def _decode_wna16_moe_kernel(
             qw_slot + widx[:, None] * stride_qkw + offs_n[None, :] * stride_qn,
             mask=w_mask[:, None] & n_mask[None, :], other=0,
         )
-        g = widx // (GROUP // 8)
+        g = (widx + K_OFF // 8) // (GROUP // 8)
         zword = tl.load(
             qz_slot + g[:, None] * stride_zg + (offs_n[None, :] // 8) * stride_zn,
             mask=w_mask[:, None] & n_mask[None, :], other=0,
@@ -168,6 +169,7 @@ def _prefill_wna16_moe_kernel(
     K,
     EM,
     num_valid_tokens,
+    K_OFF,
     GROUP: tl.constexpr,
     stride_am, stride_ak,
     stride_qe, stride_qkw, stride_qn,
@@ -216,7 +218,7 @@ def _prefill_wna16_moe_kernel(
         widx = kw * BLOCK_SIZE_KW + offs_kw
         w_mask = widx < K_WORDS
         word = tl.load(qw_base + widx[:, None] * stride_qkw, mask=w_mask[:, None], other=0)
-        g = widx // (GROUP // 8)
+        g = (widx + K_OFF // 8) // (GROUP // 8)
         zword = tl.load(qz_base + g[:, None] * stride_zg, mask=w_mask[:, None], other=0)
         zero = ((zword >> (4 * (offs_bn[None, :] % 8))) & 0xF) + 1  # GPTQ stores zero-point - 1
         scale = tl.load(sc_base + g[:, None] * stride_sg, mask=w_mask[:, None], other=0.0).to(tl.float32)
@@ -239,4 +241,99 @@ def _prefill_wna16_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-__all__ = ["_decode_wna16_moe_kernel", "_decode_wna16_splitk_reduce", "_prefill_wna16_moe_kernel"]
+@triton.jit
+def _prefill_wna16_moe_tile_kernel(
+    a_ptr,
+    qw_ptr,
+    qz_ptr,
+    sc_ptr,
+    c_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    K_OFF,
+    GROUP: tl.constexpr,
+    stride_am, stride_ak,
+    stride_qe, stride_qkw, stride_qn,
+    stride_ze, stride_zg, stride_zn,
+    stride_se, stride_sg, stride_sn,
+    stride_cm, stride_cn,
+    stride_tw,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+):
+    """Same contract and dequant arithmetic as ``_prefill_wna16_moe_kernel``, but each
+    K step dequantizes a whole [BLOCK_K, BLOCK_N] tile (word k // 8, nibble k % 8) and
+    issues one dot against a contiguous A tile, instead of eight K=BLOCK_KW dots over
+    stride-8 A columns. K and K_OFF must be multiples of BLOCK_K and BLOCK_K must divide
+    GROUP, so a K step never straddles a quantization group."""
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    slot = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+
+    a_ptrs = a_ptr + (offs_token[:, None] // top_k) * stride_am + offs_k[None, :] * stride_ak
+    qw_ptrs = (qw_ptr + slot * stride_qe + (offs_k[:, None] // 8) * stride_qkw
+               + offs_bn[None, :] * stride_qn)
+    qz_ptrs = qz_ptr + slot * stride_ze + (offs_bn // 8) * stride_zn
+    sc_ptrs = sc_ptr + slot * stride_se + offs_bn * stride_sn
+    k_shift = (offs_k[:, None] % 8) * 4
+    z_shift = (offs_bn % 8) * 4
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k0 in range(0, K // BLOCK_SIZE_K):
+        g = (k0 * BLOCK_SIZE_K + K_OFF) // GROUP
+        a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+        word = tl.load(qw_ptrs)
+        zero = ((tl.load(qz_ptrs + g * stride_zg) >> z_shift) & 0xF) + 1  # GPTQ stores zero-point - 1
+        scale = tl.load(sc_ptrs + g * stride_sg).to(tl.float32)
+        code = (word >> k_shift) & 0xF
+        b = ((code - zero[None, :]).to(tl.float32) * scale[None, :]).to(a.dtype)
+        accumulator += tl.dot(a, b)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        qw_ptrs += (BLOCK_SIZE_K // 8) * stride_qkw
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token * stride_tw, mask=token_mask, other=0)
+        accumulator = accumulator * moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+__all__ = [
+    "_decode_wna16_moe_kernel",
+    "_decode_wna16_splitk_reduce",
+    "_prefill_wna16_moe_kernel",
+    "_prefill_wna16_moe_tile_kernel",
+]

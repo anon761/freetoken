@@ -70,16 +70,59 @@ def wna16_tp_geometry(intermediate: int, tp_size: int, rank: int, group: int = 1
     return (rank * groups) // tp_size * group, ((rank + 1) * groups) // tp_size * group
 
 
+_BALANCED_ENV = "FREETOKEN_WNA16_BALANCED_TP"
+# The prefill tile kernel steps K in 64s and must not straddle a group, so a balanced
+# band has to start on a multiple of 64 (640 / 2 = 320 does; group-aligned 256 / 384 is
+# the fallback).
+_BALANCED_ALIGN = 64
+
+
+def wna16_balanced_tp(intermediate: int, tp_size: int) -> bool:
+    """Even intermediate split across ranks, ``FREETOKEN_WNA16_BALANCED_TP=1`` (HF loader only).
+
+    The group-aligned split gives Flash-Next's rank 1 1.5x rank 0's expert bytes, so
+    rank 1 bounds both the prefill copy and the decode step. Balanced bands may start
+    mid-group: such a rank keeps the straddled group's scales/zeros (shared with its
+    neighbour) and the kernels offset their group index by ``wna16_down_k_off``.
+    """
+    return (
+        tp_size > 1
+        and os.environ.get(_BALANCED_ENV, "") == "1"
+        and intermediate % (tp_size * _BALANCED_ALIGN) == 0
+    )
+
+
+def wna16_tp_bands(intermediate: int, tp_size: int, rank: int, group: int = 128) -> tuple[int, int, int, int]:
+    """``(lo, hi, g_lo, g_hi)``: the rank's intermediate band and the groups it overlaps."""
+    if wna16_balanced_tp(intermediate, tp_size):
+        per = intermediate // tp_size
+        lo, hi = rank * per, (rank + 1) * per
+    else:
+        lo, hi = wna16_tp_geometry(intermediate, tp_size, rank, group)
+    return lo, hi, lo // group, -(-hi // group)
+
+
+def wna16_down_k_off(k_local: int, group: int = 128) -> int:
+    """Offset of this rank's first down-proj K row inside its first quantization group."""
+    from freetoken.distributed import get_tp_info
+
+    tp = get_tp_info()
+    if not wna16_balanced_tp(k_local * tp.size, tp.size):
+        return 0
+    return (tp.rank * k_local) % group
+
+
 def _tp_slice_piece(spec: Wna16ExpertSourceSpec, role: str, tensor: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
     """One expert piece -> this rank's intermediate slice ``[lo, hi)``.
 
     ``gate``/``up`` slice their output axis ``N`` (last dim); ``down`` slices its packed
-    input axis ``K`` (first dim, at the group/8 granularity of each tensor).
+    input axis ``K`` (first dim): qweight at word granularity, scales/zeros keep every
+    group the band overlaps (a balanced band may start or end mid-group).
     """
     g = spec.group_size
     if role.startswith("down"):
         if role.endswith("_scale") or role.endswith("_zero"):
-            return tensor[lo // g : hi // g]
+            return tensor[lo // g : -(-hi // g)]
         return tensor[lo // 8 : hi // 8]
     if role.endswith("_zero"):
         return tensor[..., lo // 8 : hi // 8]
@@ -131,7 +174,7 @@ def iter_wna16_expert_pieces(
     from freetoken.distributed import get_tp_info
 
     _tp = get_tp_info()
-    lo, hi = wna16_tp_geometry(config.moe_intermediate_size, _tp.size, _tp.rank, spec.group_size)
+    lo, hi, _, _ = wna16_tp_bands(config.moe_intermediate_size, _tp.size, _tp.rank, spec.group_size)
 
     def _serial():
         by_shard: dict[str, list[str]] = collections.defaultdict(list)
@@ -155,4 +198,4 @@ def iter_wna16_expert_pieces(
     return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
 
 
-__all__ = ["Wna16ExpertSourceSpec", "iter_wna16_expert_pieces"]
+__all__ = ["Wna16ExpertSourceSpec", "iter_wna16_expert_pieces", "wna16_balanced_tp", "wna16_down_k_off", "wna16_tp_bands"]

@@ -412,8 +412,15 @@ class IoUringBatchReader final : public BatchReader {
 std::unique_ptr<BatchReader> make_batch_reader(bool use_io_uring) {
 #if PLE_HAS_IO_URING
   if (use_io_uring) {
+    // 64 in flight leaves NVMe random 4 KiB reads latency-bound: two TP ranks reading an
+    // 8192-token prefill's ~130k rows each take 907 ms at 64, 775 at 256 (no gain past it).
+    unsigned depth = 256;
+    if (const char *env = std::getenv("FREETOKEN_PLE_QUEUE_DEPTH")) {
+      const int v = std::atoi(env);
+      if (v > 0) depth = std::min(4096u, (unsigned)v);
+    }
     auto ring = std::make_unique<IoUringBatchReader>();
-    if (ring->init(kBatchEntries)) return ring;
+    if (ring->init(depth)) return ring;
   }
 #else
   (void)use_io_uring;
