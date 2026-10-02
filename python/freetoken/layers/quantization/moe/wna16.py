@@ -45,18 +45,19 @@ class TritonWna16MoEKernel(MoEKernel):
         return f"triton wna16 MoE kernel: {reason}" if reason else None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        from freetoken.models.wna16_banks import wna16_tp_geometry
+        from freetoken.models.wna16_banks import wna16_tp_bands
 
-        # The rank's intermediate slice is group-aligned (down's K == gate/up's N).
-        k_lo, k_hi = wna16_tp_geometry(cfg.intermediate, cfg.tp_size, cfg.tp_rank)
-        i, h = k_hi - k_lo, cfg.hidden
+        # down's K == gate/up's N == the rank's intermediate band; down keeps every
+        # quantization group the band overlaps (more than i // 128 for a balanced band).
+        k_lo, k_hi, g_lo, g_hi = wna16_tp_bands(cfg.intermediate, cfg.tp_size, cfg.tp_rank)
+        i, h, dg = k_hi - k_lo, cfg.hidden, g_hi - g_lo
         return {
             "gate_up": BankSpec((h // 8, 2 * i), torch.int32),
             "gate_up_zero": BankSpec((h // 128, 2 * i // 8), torch.int32),
             "gate_up_scale": BankSpec((h // 128, 2 * i), FP16),
             "down": BankSpec((i // 8, h), torch.int32),
-            "down_zero": BankSpec((i // 128, h // 8), torch.int32),
-            "down_scale": BankSpec((i // 128, h), FP16),
+            "down_zero": BankSpec((dg, h // 8), torch.int32),
+            "down_scale": BankSpec((dg, h), FP16),
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
@@ -69,20 +70,24 @@ class TritonWna16MoEKernel(MoEKernel):
         return {}
 
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
+        from freetoken.models.wna16_banks import wna16_down_k_off
         from freetoken.moe.fused_wna16 import fused_experts_decode_wna16, fused_experts_wna16
 
         t = view.tensors
         banks = (t["gate_up"], t["gate_up_zero"], t["gate_up_scale"],
                  t["down"], t["down_zero"], t["down_scale"])
         alpha, limit = float(layer.alpha), limit_or_inf(layer)
+        k_off = wna16_down_k_off(t["down"].shape[-2] * 8)
         if is_prefill:
             return fused_experts_wna16(
                 x, *banks, topk_weights, topk_ids, view.n,
                 layer.activation, layer.apply_router_weight_on_input, alpha, limit,
+                down_k_off=k_off,
             )
         return fused_experts_decode_wna16(
             x, *banks, topk_weights, topk_ids,
             layer.activation, layer.apply_router_weight_on_input, alpha, limit,
+            down_k_off=k_off,
         )
 
 
